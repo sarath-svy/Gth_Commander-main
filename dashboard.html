@@ -1,0 +1,1077 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Goethe Fleet Commander</title>
+<style>
+/* ===================== THEME TOKENS (Glassmorphism) ===================== */
+:root[data-theme="dark"]{
+  --app-bg:#070b16;
+  --glass:rgba(28,38,66,0.45);
+  --glass2:rgba(18,26,48,0.55);
+  --glass-hi:rgba(255,255,255,0.06);
+  --panel:rgba(28,38,66,0.45);
+  --panel2:rgba(12,18,36,0.55);
+  --line:rgba(255,255,255,0.12);
+  --line2:rgba(255,255,255,0.07);
+  --text:#eaf0ff; --muted:#9fb0d0; --faint:#6b7b9b;
+  --brand:#5b9dff; --brand2:#3f7fe6;
+  --accent:#ffb24d; --success:#3ee08f; --danger:#ff5d6c; --purple:#b07cff;
+  --shadow:0 12px 40px rgba(0,0,0,.5);
+  --glow:0 0 0 3px rgba(91,157,255,.25);
+  --blur:18px;
+}
+:root[data-theme="light"]{
+  --app-bg:#dfe7f5;
+  --glass:rgba(255,255,255,0.55);
+  --glass2:rgba(255,255,255,0.4);
+  --glass-hi:rgba(255,255,255,0.5);
+  --panel:rgba(255,255,255,0.55);
+  --panel2:rgba(255,255,255,0.38);
+  --line:rgba(20,40,90,0.14);
+  --line2:rgba(20,40,90,0.08);
+  --text:#16203a; --muted:#51618a; --faint:#8593b5;
+  --brand:#2f6bff; --brand2:#1f57e0;
+  --accent:#e08a14; --success:#16a34a; --danger:#e23744; --purple:#8b46ff;
+  --shadow:0 12px 40px rgba(50,80,150,.18);
+  --glow:0 0 0 3px rgba(47,107,255,.2);
+  --blur:18px;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  font-family:'Segoe UI',Inter,Roboto,system-ui,sans-serif;
+  color:var(--text); min-height:100vh; position:relative;
+  background:var(--app-bg);
+  overflow-x:hidden; transition:color .3s;
+}
+/* living aurora gradient behind the frosted glass */
+body::before{
+  content:''; position:fixed; inset:-20% -10% -10% -10%; z-index:-2;
+  background:
+    radial-gradient(600px 600px at 12% 18%, rgba(91,157,255,.35), transparent 60%),
+    radial-gradient(700px 700px at 88% 12%, rgba(176,124,255,.30), transparent 60%),
+    radial-gradient(650px 650px at 72% 88%, rgba(62,224,143,.20), transparent 60%),
+    radial-gradient(600px 600px at 22% 92%, rgba(255,178,77,.16), transparent 60%);
+  filter:blur(40px); animation:drift 22s ease-in-out infinite alternate;
+}
+body::after{
+  content:''; position:fixed; inset:0; z-index:-1; pointer-events:none;
+  background-image:radial-gradient(rgba(255,255,255,.04) 1px, transparent 1px);
+  background-size:22px 22px;
+}
+@keyframes drift{
+  0%{transform:translate3d(0,0,0) scale(1)}
+  100%{transform:translate3d(-3%,2%,0) scale(1.08)}
+}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:rgba(255,255,255,.18);border-radius:8px}
+::-webkit-scrollbar-track{background:transparent}
+a{color:var(--brand);text-decoration:none}
+a:hover{text-decoration:underline}
+code{background:rgba(91,157,255,.16);color:var(--brand);padding:1px 6px;border-radius:5px;font-size:.82em}
+
+/* ===================== LAYOUT ===================== */
+.topbar{
+  position:sticky; top:0; z-index:50;
+  display:flex; align-items:center; gap:16px;
+  padding:14px 22px;
+  background:var(--glass2);
+  -webkit-backdrop-filter:blur(var(--blur)) saturate(150%); backdrop-filter:blur(var(--blur)) saturate(150%);
+  border-bottom:1px solid var(--line);
+}
+.brand{display:flex; align-items:center; gap:11px; font-weight:700; font-size:1.12rem}
+.brand .logo{
+  width:36px;height:36px;border-radius:11px;display:grid;place-items:center;
+  background:linear-gradient(135deg,var(--brand),var(--purple));color:#fff;font-size:1.05rem;
+  box-shadow:0 6px 20px rgba(91,157,255,.5), inset 0 1px 0 rgba(255,255,255,.4);
+}
+.brand small{display:block;font-weight:500;font-size:.7rem;color:var(--muted);letter-spacing:.3px}
+.topbar .spacer{flex:1}
+.pill{
+  display:inline-flex;align-items:center;gap:7px;font-size:.8rem;color:var(--muted);
+  background:var(--glass-hi);border:1px solid var(--line);padding:6px 13px;border-radius:30px;
+  -webkit-backdrop-filter:blur(8px); backdrop-filter:blur(8px);
+}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--faint)}
+.dot.on{background:var(--success);box-shadow:0 0 10px var(--success)}
+.icon-btn{
+  width:40px;height:40px;border-radius:12px;border:1px solid var(--line);
+  background:var(--glass-hi);color:var(--text);cursor:pointer;font-size:1.05rem;
+  display:grid;place-items:center;transition:.2s; -webkit-backdrop-filter:blur(8px); backdrop-filter:blur(8px);
+}
+.icon-btn:hover{border-color:var(--brand);box-shadow:var(--glow);transform:translateY(-1px)}
+
+.wrap{max-width:1440px;margin:0 auto;padding:24px}
+.grid{display:grid;grid-template-columns:390px 1fr;gap:20px;align-items:start}
+@media (max-width:1050px){ .grid{grid-template-columns:1fr} }
+
+/* frosted glass card */
+.card{
+  background:var(--glass);
+  -webkit-backdrop-filter:blur(var(--blur)) saturate(140%); backdrop-filter:blur(var(--blur)) saturate(140%);
+  border:1px solid var(--line);border-radius:20px;
+  box-shadow:var(--shadow), inset 0 1px 0 var(--glass-hi);
+  overflow:hidden; transition:transform .25s, box-shadow .25s;
+}
+.card:hover{box-shadow:var(--shadow), inset 0 1px 0 var(--glass-hi), 0 0 0 1px rgba(91,157,255,.12)}
+.card-h{
+  display:flex;align-items:center;gap:10px;padding:16px 20px;
+  border-bottom:1px solid var(--line2); font-weight:600; font-size:1rem;
+  background:linear-gradient(180deg, var(--glass-hi), transparent);
+}
+.card-h .ic{
+  width:30px;height:30px;border-radius:10px;display:grid;place-items:center;font-size:.95rem;
+  background:linear-gradient(135deg, rgba(91,157,255,.35), rgba(176,124,255,.25));
+  color:#fff; box-shadow:inset 0 1px 0 rgba(255,255,255,.3);
+}
+.card-b{padding:20px}
+.card-h .spacer{flex:1}
+
+/* tabs */
+.tabs{display:flex;gap:5px;padding:5px;background:var(--glass2);border:1px solid var(--line2);border-radius:14px;margin-bottom:18px}
+.tab{
+  flex:1;text-align:center;padding:10px;border-radius:10px;cursor:pointer;font-size:.84rem;
+  color:var(--muted);font-weight:600;transition:.2s;border:1px solid transparent;
+}
+.tab.active{background:var(--glass-hi);color:var(--text);border-color:var(--line);box-shadow:inset 0 1px 0 rgba(255,255,255,.2)}
+.tabpane{display:none}
+.tabpane.active{display:block;animation:fade .3s ease}
+@keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+
+/* form fields */
+.field{margin-bottom:15px}
+.field:last-child{margin-bottom:0}
+.lbl{display:block;margin-bottom:7px;font-size:.78rem;color:var(--muted);font-weight:600;letter-spacing:.2px}
+.inp{
+  width:100%;padding:12px 14px;background:var(--glass2);border:1px solid var(--line);
+  color:var(--text);border-radius:12px;font-size:.9rem;transition:.2s;font-family:inherit;
+  -webkit-backdrop-filter:blur(6px); backdrop-filter:blur(6px);
+}
+.inp::placeholder{color:var(--faint)}
+.inp:focus{outline:none;border-color:var(--brand);box-shadow:var(--glow)}
+textarea.inp{resize:vertical;font-family:'Consolas',monospace;font-size:.82rem;line-height:1.5}
+.row{display:grid;gap:12px}
+.row.c2{grid-template-columns:1fr 1fr}
+.hint{font-size:.76rem;color:var(--faint);margin-top:6px}
+
+/* info callout */
+.note{
+  border-radius:12px;padding:12px 14px;margin-bottom:15px;font-size:.8rem;
+  color:var(--muted);line-height:1.55;background:var(--glass2);border:1px solid var(--line2);
+}
+.note b{color:var(--text)}
+.note details summary{cursor:pointer;color:var(--brand);font-weight:600;font-size:.8rem;outline:none}
+.note details[open] summary{margin-bottom:8px}
+
+/* buttons */
+.btn{
+  border:none;border-radius:12px;cursor:pointer;font-weight:600;font-size:.88rem;
+  padding:11px 16px;transition:.2s;font-family:inherit;display:inline-flex;
+  align-items:center;justify-content:center;gap:7px;
+}
+.btn:active{transform:translateY(1px)}
+.btn-primary{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;box-shadow:0 6px 18px rgba(91,157,255,.4)}
+.btn-primary:hover{filter:brightness(1.08);transform:translateY(-1px)}
+.btn-soft{background:var(--glass-hi);color:var(--text);border:1px solid var(--line);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
+.btn-soft:hover{border-color:var(--brand);box-shadow:var(--glow)}
+.btn-ghost{background:transparent;color:var(--danger);border:1px solid color-mix(in srgb,var(--danger) 50%,transparent)}
+.btn-ghost:hover{background:color-mix(in srgb,var(--danger) 14%,transparent)}
+.btn-lg{width:100%;padding:16px;font-size:1rem;border-radius:14px}
+.btn-start{background:linear-gradient(135deg,var(--success),#15a34a);color:#06231a;font-weight:700;box-shadow:0 8px 24px color-mix(in srgb,var(--success) 45%,transparent)}
+.btn-start:disabled{background:var(--glass2);color:var(--faint);cursor:not-allowed;box-shadow:none}
+.btn-stop{background:linear-gradient(135deg,var(--danger),#c11d1d);color:#fff;margin-top:10px;box-shadow:0 8px 24px color-mix(in srgb,var(--danger) 40%,transparent)}
+
+/* segmented control */
+.seg{display:flex;background:var(--glass2);border:1px solid var(--line);border-radius:12px;padding:4px}
+.seg button{
+  flex:1;border:none;background:none;color:var(--muted);padding:9px;border-radius:9px;
+  cursor:pointer;font-size:.82rem;font-weight:600;font-family:inherit;transition:.2s;
+}
+.seg button.active{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;box-shadow:0 4px 14px rgba(91,157,255,.4)}
+
+/* checkbox chips */
+.chips{display:flex;flex-wrap:wrap;gap:8px}
+.chip{
+  display:inline-flex;align-items:center;gap:7px;font-size:.82rem;cursor:pointer;user-select:none;
+  background:var(--glass2);border:1px solid var(--line);padding:9px 13px;border-radius:11px;transition:.2s;
+}
+.chip:has(input:checked){border-color:var(--brand);background:rgba(91,157,255,.18);box-shadow:inset 0 0 12px rgba(91,157,255,.15)}
+.chip input{accent-color:var(--brand);width:15px;height:15px;cursor:pointer;margin:0}
+
+/* stat tiles */
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:20px}
+@media (max-width:560px){ .stats{grid-template-columns:repeat(2,1fr)} }
+.stat{
+  background:var(--glass);border:1px solid var(--line);border-radius:18px;padding:16px 18px;
+  -webkit-backdrop-filter:blur(var(--blur)); backdrop-filter:blur(var(--blur));
+  box-shadow:var(--shadow), inset 0 1px 0 var(--glass-hi); position:relative; overflow:hidden;
+}
+.stat::after{content:'';position:absolute;top:-40%;right:-20%;width:120px;height:120px;border-radius:50%;filter:blur(30px);opacity:.5}
+.stat .v{font-size:1.7rem;font-weight:800;line-height:1;position:relative}
+.stat .k{font-size:.72rem;color:var(--muted);margin-top:7px;text-transform:uppercase;letter-spacing:.5px;position:relative}
+.stat.b .v{color:var(--brand)} .stat.b::after{background:var(--brand)}
+.stat.g .v{color:var(--success)} .stat.g::after{background:var(--success)}
+.stat.a .v{color:var(--accent)} .stat.a::after{background:var(--accent)}
+.stat.r .v{color:var(--danger)} .stat.r::after{background:var(--danger)}
+
+/* drone cards */
+.drones{display:grid;grid-template-columns:repeat(auto-fill,minmax(235px,1fr));gap:16px}
+.drone{
+  background:var(--glass2);border:1px solid var(--line);border-radius:16px;padding:16px;
+  position:relative;overflow:hidden;transition:.25s;
+  -webkit-backdrop-filter:blur(10px); backdrop-filter:blur(10px);
+}
+.drone::before{content:'';position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--faint);transition:.25s;box-shadow:0 0 12px var(--faint)}
+.drone[data-active="1"]{box-shadow:var(--shadow), inset 0 1px 0 var(--glass-hi);transform:translateY(-2px)}
+.drone .dh{display:flex;align-items:center;justify-content:space-between;margin-bottom:11px}
+.drone .dt{font-weight:700;font-size:.92rem;display:flex;align-items:center;gap:8px}
+.drone .dt .id{width:26px;height:26px;border-radius:8px;display:grid;place-items:center;background:linear-gradient(135deg,rgba(91,157,255,.3),rgba(176,124,255,.2));font-size:.78rem;color:#fff}
+.pagebadge{font-size:.62rem;font-weight:700;padding:4px 9px;border-radius:20px;background:var(--glass-hi);color:var(--muted);letter-spacing:.5px}
+.drow{font-size:.8rem;color:var(--muted);margin-top:7px;display:flex;align-items:center;gap:6px;word-break:break-word}
+.drow .lab{color:var(--faint);min-width:46px}
+.drow.user{color:var(--accent);font-weight:600}
+
+/* terminal */
+.terminal{
+  background:var(--glass2);border:1px solid var(--line);border-radius:14px;
+  font-family:'Consolas',monospace;font-size:.8rem;padding:14px;height:215px;
+  overflow-y:auto;line-height:1.55; -webkit-backdrop-filter:blur(6px); backdrop-filter:blur(6px);
+}
+.terminal .le{margin-bottom:3px;display:flex;gap:8px}
+.terminal .tm{color:var(--faint);flex-shrink:0}
+.l-info .tx{color:var(--brand)} .l-warn .tx{color:var(--accent)}
+.l-error .tx{color:var(--danger)} .l-success .tx{color:var(--success)}
+
+/* users table */
+.utable{width:100%;border-collapse:collapse;font-size:.86rem}
+.utable thead th{
+  text-align:left;padding:12px 14px;color:var(--muted);font-size:.72rem;
+  text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--line);font-weight:700;
+}
+.utable tbody td{padding:14px;border-bottom:1px solid var(--line2);vertical-align:top}
+.utable tbody tr{transition:.15s}
+.utable tbody tr:hover{background:var(--glass-hi)}
+.badge{display:inline-flex;align-items:center;gap:5px;padding:6px 12px;border-radius:20px;font-size:.76rem;font-weight:700;background:var(--glass-hi);border:1px solid var(--line)}
+.mods label{display:inline-flex;align-items:center;gap:5px;font-size:.8rem;margin:0 10px 7px 0;cursor:pointer}
+.mods input{accent-color:var(--brand);margin:0}
+.mods .partial{display:block;margin-top:2px;color:var(--accent);font-size:.78rem}
+.empty{text-align:center;color:var(--faint);padding:28px;font-size:.88rem}
+</style>
+</head>
+<body>
+
+<!-- ===================== TOP BAR ===================== -->
+<div class="topbar">
+  <div class="brand">
+    <div class="logo">🚀</div>
+    <div>Goethe Fleet Commander<small>Automated exam slot booking</small></div>
+  </div>
+  <div class="spacer"></div>
+  <div class="pill" id="systemPill"><span class="dot" id="liveDot"></span><span id="systemText">Analyzing…</span></div>
+  <button class="icon-btn" id="themeToggle" onclick="toggleTheme()" title="Toggle theme">🌙</button>
+</div>
+
+<div class="wrap">
+
+  <!-- STAT TILES -->
+  <div class="stats">
+    <div class="stat b"><div class="v" id="statDrones">0</div><div class="k">Active Drones</div></div>
+    <div class="stat g"><div class="v" id="statBooked">0</div><div class="k">Booked</div></div>
+    <div class="stat a"><div class="v" id="statQueued">0</div><div class="k">Queued Users</div></div>
+    <div class="stat r"><div class="v" id="statFailed">0</div><div class="k">Failed</div></div>
+  </div>
+
+  <div class="grid">
+
+  <!-- ===================== LEFT: CONFIG ===================== -->
+  <div class="card">
+    <div class="card-h"><div class="ic">⚙️</div> Configuration</div>
+    <div class="card-b">
+
+      <div class="tabs">
+        <div class="tab active" data-tab="general" onclick="switchTab('general')">General</div>
+        <div class="tab" data-tab="payment" onclick="switchTab('payment')">Payment</div>
+        <div class="tab" data-tab="network" onclick="switchTab('network')">Network</div>
+      </div>
+
+      <!-- GENERAL TAB -->
+      <div class="tabpane active" id="tab-general">
+        <div class="field">
+          <label class="lbl">Target Exam URL</label>
+          <input type="text" id="targetUrl" class="inp" placeholder="https://www.goethe.de/ins/in/en/sta/..." oninput="validateForm()">
+        </div>
+        <div class="field">
+          <label class="lbl">Browser Engine</label>
+          <div class="seg" id="engineSeg">
+            <button class="active" data-engine="edge" onclick="setEngine('edge')">🌊 Edge</button>
+            <button data-engine="chrome" onclick="setEngine('chrome')">🌐 Chrome</button>
+            <button data-engine="cloak" onclick="setEngine('cloak')">🥷 Cloak</button>
+          </div>
+          <div class="hint" id="engineHint"></div>
+        </div>
+        <div class="field">
+          <label class="lbl">Max Drones</label>
+          <input type="number" id="maxBrowsers" class="inp" value="2" min="1" max="10" onchange="renderDrones()">
+        </div>
+        <div class="field">
+          <label class="lbl">Auto-Spotlight Page <span style="font-weight:400;color:var(--faint)">(auto bring a drone to front when it reaches this page)</span></label>
+          <select id="autoFocusPage" class="inp">
+            <option value="">Off</option>
+            <option value="options">Options page</option>
+            <option value="selection">Selection page</option>
+            <option value="login">Login page</option>
+            <option value="summary">Summary page</option>
+            <option value="payment" selected>Payment page</option>
+          </select>
+        </div>
+        <div class="field">
+          <label class="chip" style="width:100%"><input type="checkbox" id="autoRetry"> 🔁 Auto-retry failed logins <span style="color:var(--faint);font-size:.78rem">(tolerate transient errors, up to 2 tries)</span></label>
+        </div>
+        <div class="field">
+          <label class="lbl">⏰ Scheduled Start <span style="font-weight:400;color:var(--faint)">(leave blank to start manually)</span></label>
+          <div class="row c2">
+            <input type="datetime-local" id="scheduleAt" class="inp">
+            <button class="btn btn-soft" onclick="armSchedule()">Arm Schedule</button>
+          </div>
+          <div class="hint" id="scheduleHint"></div>
+        </div>
+        <div class="note" id="chromeWarn" style="display:none;border-color:color-mix(in srgb,var(--danger) 40%,transparent)">
+          ⚠️ <b>Chrome 137+ can't auto-load extensions.</b> Either use <b>Edge</b>, or download
+          <a href="https://googlechromelabs.github.io/chrome-for-testing/" target="_blank">Chrome for Testing</a>
+          and paste its path in the Browser Path field below.
+        </div>
+        <div class="note" id="cloakInfo" style="display:none;border-color:color-mix(in srgb,var(--purple) 45%,transparent)">
+          🥷 <b>CloakBrowser</b> is a stealth Chromium that fakes a unique, consistent fingerprint per profile (canvas, WebGL, audio, fonts) at the source level — so each drone looks like a different physical device, not just a different IP.<br><br>
+          1. Install it: <code>pip install cloakbrowser</code> then <code>python -m cloakbrowser install</code><br>
+          2. Click <b>Auto-Detect</b> below (or paste the path to its <code>chrome.exe</code> manually).<br>
+          3. The bot's extension loads normally in CloakBrowser.<br>
+          <button class="btn btn-soft" style="margin-top:9px;padding:7px 12px;font-size:.8rem" onclick="detectCloak()">🔎 Auto-Detect CloakBrowser</button>
+          <span id="cloakDetectMsg" class="hint" style="margin-left:8px"></span>
+        </div>
+        <div class="field" id="browserPathField" style="display:none">
+          <label class="lbl">Browser Path (for Chrome-for-Testing / CloakBrowser)</label>
+          <input type="text" id="customBrowserPath" class="inp" placeholder="C:\path\to\chrome.exe">
+        </div>
+      </div>
+
+      <!-- PAYMENT TAB -->
+      <div class="tabpane" id="tab-payment">
+        <div class="note">
+          <details><summary>How payment works</summary>
+            This card auto-fills on the payment page for every user. After the bot clicks <b>Pay</b>, you complete the bank OTP / 3D-Secure manually in each browser window.
+          </details>
+        </div>
+        <div class="field"><label class="lbl">Name on Card</label>
+          <input type="text" id="ccName" class="inp" placeholder="John Doe" oninput="validateForm()"></div>
+        <div class="field"><label class="lbl">Card Number</label>
+          <input type="text" id="ccNum" class="inp" placeholder="4532 xxxx xxxx xxxx" oninput="validateForm()"></div>
+        <div class="row c2">
+          <div class="field"><label class="lbl">Expiry (MM/YY)</label>
+            <input type="text" id="ccExp" class="inp" placeholder="12/26" maxlength="5" oninput="validateForm()"></div>
+          <div class="field"><label class="lbl">CVV</label>
+            <input type="text" id="ccCvv" class="inp" placeholder="123" maxlength="4" oninput="validateForm()"></div>
+        </div>
+      </div>
+
+      <!-- NETWORK TAB -->
+      <div class="tabpane" id="tab-network">
+        <div class="note">
+          <details><summary>Why IP rotation?</summary>
+            Goethe rate-limits IPs that send too many requests (HTTP 429). Each drone uses a different IP and auto-rotates to a fresh one when blocked.<br><br>
+            • <b>None</b> — all drones share your real IP.<br>
+            • <b>Custom Proxies</b> — paste IPs from any provider.<br>
+            • <b>NordVPN</b> — uses your NordVPN plan's SOCKS5 servers (NL, SE, US only).
+          </details>
+        </div>
+        <div class="field">
+          <label class="lbl">Rotation Mode</label>
+          <select id="proxyMode" class="inp" onchange="toggleProxyUI()">
+            <option value="none">🚫 None (real IP)</option>
+            <option value="custom">📋 Custom Proxy List</option>
+            <option value="nordvpn">🛡️ NordVPN SOCKS5</option>
+          </select>
+        </div>
+
+        <div id="customProxySection" style="display:none">
+          <div class="note">📋 One proxy per line: <code>host:port</code>, <code>host:port:user:pass</code>, or <code>socks5://user:pass@host:port</code>. Lines starting with # are ignored.</div>
+          <textarea id="proxyList" class="inp" style="height:96px" placeholder="# one per line&#10;192.168.1.10:8080&#10;proxy.com:3128:user:pass"></textarea>
+          <div class="hint" id="proxyCount">0 proxies detected</div>
+        </div>
+
+        <div id="nordvpnSection" style="display:none">
+          <div class="note">🛡️ Get your <b>Service Username/Password</b> (not login email) from
+            <a href="https://my.nordaccount.com/dashboard/nordvpn/manual-configuration/" target="_blank">NordVPN → Manual Setup → Service Credentials</a>.</div>
+          <div class="row c2 field">
+            <input type="text" id="nordUser" class="inp" placeholder="Service Username">
+            <input type="password" id="nordPass" class="inp" placeholder="Service Password">
+          </div>
+          <label class="lbl">Countries</label>
+          <div class="chips">
+            <label class="chip"><input type="checkbox" class="nord-country" value="nl" checked> 🇳🇱 Netherlands</label>
+            <label class="chip"><input type="checkbox" class="nord-country" value="se" checked> 🇸🇪 Sweden</label>
+            <label class="chip"><input type="checkbox" class="nord-country" value="us" checked> 🇺🇸 USA</label>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top:18px;display:grid;gap:8px">
+        <button class="btn btn-soft" onclick="saveData()">💾 Save Configuration</button>
+        <button class="btn btn-soft" onclick="downloadHistory()">📊 Download Booking History (CSV)</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== RIGHT: OPERATIONS ===================== -->
+  <div>
+    <!-- COMMAND DECK -->
+    <div class="card" style="margin-bottom:18px">
+      <div class="card-h"><div class="ic">🎛️</div> Command Deck
+        <div class="spacer"></div>
+        <span class="pill" id="proxyPill" style="display:none">🌐 <span id="proxyPillTxt">0/0</span></span>
+      </div>
+      <div class="card-b">
+        <button id="btnStart" class="btn btn-lg btn-start" disabled onclick="startFleet()">▶ Ignite Swarm</button>
+        <button id="btnStop" class="btn btn-lg btn-stop" onclick="emergencyStop()">🛑 Emergency Stop</button>
+      </div>
+    </div>
+
+    <!-- DRONE MONITOR -->
+    <div class="card" style="margin-bottom:18px">
+      <div class="card-h"><div class="ic">🖥️</div> Drone Monitor
+        <div class="spacer"></div>
+        <button class="btn btn-soft" style="padding:5px 12px;font-size:.76rem" onclick="addDronePrompt()">➕ Add Drone</button>
+        <button class="btn btn-soft" style="padding:5px 12px;font-size:.76rem;margin-left:6px" onclick="restoreAll()">🪟 Restore All</button>
+      </div>
+      <div class="card-b">
+        <div id="drones" class="drones"></div>
+      </div>
+    </div>
+
+    <!-- TERMINAL -->
+    <div class="card">
+      <div class="card-h"><div class="ic">📡</div> Activity Log
+        <div class="spacer"></div>
+        <button class="btn btn-soft" style="padding:5px 10px;font-size:.76rem" onclick="document.getElementById('statusFeed').innerHTML=''">Clear</button>
+      </div>
+      <div class="card-b">
+        <div id="statusFeed" class="terminal"></div>
+      </div>
+    </div>
+  </div>
+
+  </div><!-- /grid -->
+
+  <!-- ===================== USERS ===================== -->
+  <div class="card" style="margin-top:18px">
+    <div class="card-h"><div class="ic">👥</div> User Queue
+      <div class="spacer"></div>
+      <button class="btn btn-primary" style="padding:8px 14px" onclick="addUser()">➕ Add User</button>
+    </div>
+    <div class="card-b" style="padding:0">
+      <table class="utable">
+        <thead><tr>
+          <th style="width:28%">Credentials</th>
+          <th style="width:34%">Modules</th>
+          <th style="width:24%">Status</th>
+          <th style="width:14%"></th>
+        </tr></thead>
+        <tbody id="userTableBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+</div><!-- /wrap -->
+
+<script>
+const API_URL = "http://localhost:3000/api";
+let userCount = -1;
+
+/* ---------- THEME ---------- */
+function applyTheme(t){
+  document.documentElement.setAttribute('data-theme', t);
+  document.getElementById('themeToggle').textContent = t === 'dark' ? '🌙' : '☀️';
+  localStorage.setItem('fleetTheme', t);
+}
+function toggleTheme(){
+  const cur = document.documentElement.getAttribute('data-theme');
+  applyTheme(cur === 'dark' ? 'light' : 'dark');
+}
+applyTheme(localStorage.getItem('fleetTheme') || 'dark');
+
+/* ---------- TABS ---------- */
+function switchTab(name){
+  document.querySelectorAll('.tab').forEach(function(t){ t.classList.toggle('active', t.dataset.tab === name); });
+  document.querySelectorAll('.tabpane').forEach(function(p){ p.classList.toggle('active', p.id === 'tab-' + name); });
+}
+
+/* ---------- ENGINE SEGMENT ---------- */
+let _engine = 'edge';
+function setEngine(e){
+  _engine = e;
+  document.querySelectorAll('#engineSeg button').forEach(function(b){ b.classList.toggle('active', b.dataset.engine === e); });
+  document.getElementById('chromeWarn').style.display = e === 'chrome' ? 'block' : 'none';
+  document.getElementById('cloakInfo').style.display = e === 'cloak' ? 'block' : 'none';
+  // Browser path field is needed for chrome (for-testing) and cloak
+  document.getElementById('browserPathField').style.display = (e === 'chrome' || e === 'cloak') ? 'block' : 'none';
+  const hint = document.getElementById('engineHint');
+  if (e === 'edge') hint.textContent = 'Edge: works out of the box. Sign-in policy blocks the Microsoft account auto-login.';
+  else if (e === 'chrome') hint.textContent = 'Chrome: needs Chrome-for-Testing for extension support (set path below).';
+  else hint.textContent = 'CloakBrowser: best anti-fingerprint protection. Set its path below.';
+}
+
+async function detectCloak(){
+  const msg = document.getElementById('cloakDetectMsg');
+  msg.textContent = 'Searching…';
+  try{
+    const r = await fetch(API_URL + '/detect-cloak');
+    const d = await r.json();
+    if (d.found){
+      document.getElementById('customBrowserPath').value = d.path;
+      msg.textContent = '✅ Found: ' + d.path;
+      log('🥷 CloakBrowser detected: ' + d.path, 'success');
+    } else {
+      msg.textContent = '❌ Not found. Install it, then retry — or paste the path manually.';
+    }
+  }catch(e){ msg.textContent = '❌ Server not reachable.'; }
+}
+
+/* ---------- PAGE METADATA + SOUND ---------- */
+const PAGE_INFO = {
+  landing:{label:'LANDING',color:'#4f8cff'}, options:{label:'OPTIONS',color:'#f59e0b'},
+  selection:{label:'SELECT',color:'#4f8cff'}, login:{label:'LOGIN',color:'#a855f7'},
+  voucher:{label:'VOUCHER',color:'#4f8cff'}, summary:{label:'SUMMARY',color:'#4f8cff'},
+  payment:{label:'PAYMENT',color:'#22c55e'}, wicket:{label:'QUEUE',color:'#ef4444'},
+  other:{label:'·',color:'#5b6b85'}
+};
+let _audioCtx = null;
+function _ctx(){ _audioCtx = _audioCtx || new (window.AudioContext || window.webkitAudioContext)(); return _audioCtx; }
+
+// A richer "note": oscillator with attack/decay envelope + optional detuned layer
+function tone(freq, startOffset, dur, type, vol){
+  try{
+    const ctx = _ctx();
+    const t0 = ctx.currentTime + (startOffset || 0);
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.type = type || 'triangle'; o.frequency.value = freq;
+    o.connect(g); g.connect(ctx.destination);
+    const v = vol == null ? 0.18 : vol;
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(v, t0 + 0.02);     // quick attack
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur); // smooth decay
+    o.start(t0); o.stop(t0 + dur + 0.02);
+  }catch(e){}
+}
+
+// OPTIONS: bright rising 3-note arpeggio (a hopeful "ping")
+function notifyOptions(){
+  tone(659, 0.00, 0.18, 'triangle', 0.16); // E5
+  tone(880, 0.10, 0.18, 'triangle', 0.16); // A5
+  tone(1318,0.20, 0.30, 'sine',     0.18); // E6 shimmer
+}
+// PAYMENT: warm 4-note "success fanfare" with a sparkle tail
+function notifyPayment(){
+  tone(523, 0.00, 0.16, 'triangle', 0.18); // C5
+  tone(659, 0.12, 0.16, 'triangle', 0.18); // E5
+  tone(784, 0.24, 0.18, 'triangle', 0.18); // G5
+  tone(1046,0.38, 0.40, 'sine',     0.20); // C6 (hold)
+  tone(1568,0.55, 0.45, 'sine',     0.12); // G6 sparkle
+}
+const _lastPage = {};
+
+/* ---------- LOG ---------- */
+function log(message, type){
+  type = type || 'info';
+  const feed = document.getElementById('statusFeed');
+  const div = document.createElement('div');
+  div.className = 'le l-' + type;
+  div.innerHTML = '<span class="tm">' + new Date().toLocaleTimeString() + '</span><span class="tx">' + escapeHtml(message) + '</span>';
+  feed.appendChild(div); feed.scrollTop = feed.scrollHeight;
+}
+function escapeHtml(s){ return String(s).replace(/[&<>]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c]; }); }
+</script>
+
+<script>
+/* ---------- HARDWARE ---------- */
+function analyzeHardware(){
+  const cores = navigator.hardwareConcurrency || 4;
+  const ram = navigator.deviceMemory || 4;
+  let s = Math.max(1, Math.floor(ram / 1.5)); if (s > cores) s = cores; if (s > 5) s = 5;
+  document.getElementById('systemText').textContent = cores + ' cores · ~' + ram + 'GB · rec. ' + s + ' drones';
+  if (!localStorage.getItem('goetheFleetData')) document.getElementById('maxBrowsers').value = s;
+  renderDrones();
+}
+
+/* ---------- PROXY UI ---------- */
+function toggleProxyUI(){
+  const mode = document.getElementById('proxyMode').value;
+  document.getElementById('customProxySection').style.display = mode === 'custom' ? 'block' : 'none';
+  document.getElementById('nordvpnSection').style.display = mode === 'nordvpn' ? 'block' : 'none';
+  document.getElementById('proxyPill').style.display = mode !== 'none' ? 'inline-flex' : 'none';
+}
+
+/* ---------- DRONE CARDS ---------- */
+function renderDrones(){
+  let n = parseInt(document.getElementById('maxBrowsers').value) || 1;
+  if (n > 10) n = 10;
+  const c = document.getElementById('drones');
+  c.innerHTML = '';
+  for (let i = 1; i <= n; i++){
+    c.innerHTML +=
+      '<div class="drone" id="drone_' + i + '" data-active="0">' +
+        '<div class="dh"><div class="dt"><span class="id">' + i + '</span> Drone ' + i + '</div>' +
+        '<span class="pagebadge" id="dPage_' + i + '">·</span></div>' +
+        '<div class="drow"><span class="lab">Status</span><span id="dStatus_' + i + '">Docked</span></div>' +
+        '<div class="drow user"><span class="lab">User</span><span id="dUser_' + i + '">—</span></div>' +
+        '<div class="drow"><span class="lab">IP</span><span id="dProxy_' + i + '">Direct</span></div>' +
+        '<button class="btn btn-soft" style="width:100%;margin-top:11px;padding:7px;font-size:.78rem" onclick="focusDrone(' + i + ')">🔍 Focus This Window</button>' +
+        '<button class="btn btn-ghost" style="width:100%;margin-top:6px;padding:7px;font-size:.78rem" onclick="killDrone(' + i + ')">🗙 Kill This Drone</button>' +
+      '</div>';
+  }
+}
+
+/* ---------- STAT TILES ---------- */
+function refreshStats(){
+  const rows = document.querySelectorAll('#userTableBody tr');
+  let queued = 0, booked = 0, failed = 0;
+  rows.forEach(function(r){
+    const b = r.querySelector('.badge');
+    const t = b ? b.textContent.toLowerCase() : '';
+    if (t.includes('booked')) booked++;
+    else if (t.includes('fail')) failed++;
+    else queued++;
+  });
+  document.getElementById('statQueued').textContent = queued;
+  document.getElementById('statBooked').textContent = booked;
+  document.getElementById('statFailed').textContent = failed;
+}
+</script>
+
+<script>
+/* ---------- USERS ---------- */
+function addUser(){
+  userCount++;
+  const id = userCount;
+  const tr = document.createElement('tr');
+  tr.id = 'userRow_' + id;
+  tr.innerHTML =
+    '<td>' +
+      '<input type="text" id="email_' + id + '" class="q-email inp" placeholder="Email" style="margin-bottom:6px" oninput="validateForm()">' +
+      '<input type="password" id="pass_' + id + '" class="inp" placeholder="Password" oninput="validateForm()">' +
+    '</td>' +
+    '<td class="mods">' +
+      '<label><input type="checkbox" id="mod_reading_' + id + '" checked> Reading</label>' +
+      '<label><input type="checkbox" id="mod_writing_' + id + '" checked> Writing</label>' +
+      '<label><input type="checkbox" id="mod_listening_' + id + '" checked> Listening</label>' +
+      '<label><input type="checkbox" id="mod_speaking_' + id + '" checked> Speaking</label>' +
+      '<span class="partial"><label><input type="checkbox" id="partial_' + id + '" checked> Allow partial booking</label></span>' +
+    '</td>' +
+    '<td>' +
+      '<span id="userStatusBadge_' + id + '" class="badge">⏳ Queued</span>' +
+      '<button id="otpBtn_' + id + '" class="btn btn-soft" style="display:none;margin-top:8px;padding:5px 10px;font-size:.76rem" onclick="markOtpComplete(' + id + ')">✅ OTP Done</button>' +
+    '</td>' +
+    '<td><button class="btn btn-ghost" style="padding:7px 11px" onclick="removeUser(' + id + ')">🗑</button></td>';
+  document.getElementById('userTableBody').appendChild(tr);
+  validateForm(); refreshStats();
+}
+function removeUser(id){ const r = document.getElementById('userRow_' + id); if (r) r.remove(); validateForm(); refreshStats(); }
+
+function validateForm(){
+  const url = document.getElementById('targetUrl').value.trim();
+  const btn = document.getElementById('btnStart');
+  let hasUser = false;
+  document.querySelectorAll('.q-email').forEach(function(el){ if (el.value.trim()) hasUser = true; });
+  btn.disabled = !(url && hasUser);
+  btn.textContent = btn.disabled ? '▶ Ignite Swarm (add URL + user)' : '▶ Ignite Swarm';
+}
+
+document.addEventListener('input', function(e){
+  if (e.target && e.target.id === 'proxyList'){
+    const n = e.target.value.split('\n').filter(function(l){ return l.trim() && !l.trim().startsWith('#'); }).length;
+    document.getElementById('proxyCount').textContent = n + ' proxies detected';
+  }
+});
+</script>
+
+<script>
+/* ---------- SAVE / LOAD ---------- */
+function collectConfig(){
+  return {
+    targetUrl: document.getElementById('targetUrl').value,
+    browserType: _engine,
+    customBrowserPath: document.getElementById('customBrowserPath').value,
+    maxBrowsers: document.getElementById('maxBrowsers').value,
+    autoFocusPage: document.getElementById('autoFocusPage').value,
+    autoRetry: document.getElementById('autoRetry').checked,
+    ccName: document.getElementById('ccName').value,
+    ccNum: document.getElementById('ccNum').value,
+    ccExp: document.getElementById('ccExp').value,
+    ccCvv: document.getElementById('ccCvv').value,
+    proxyMode: document.getElementById('proxyMode').value,
+    proxyList: document.getElementById('proxyList').value,
+    nordUser: document.getElementById('nordUser').value,
+    nordPass: document.getElementById('nordPass').value,
+    nordCountries: Array.from(document.querySelectorAll('.nord-country:checked')).map(function(el){ return el.value; })
+  };
+}
+function saveData(){
+  const users = [];
+  document.querySelectorAll('#userTableBody tr').forEach(function(row){
+    const id = row.id.split('_')[1];
+    users.push({
+      email: document.getElementById('email_' + id).value,
+      pass: document.getElementById('pass_' + id).value,
+      reading: document.getElementById('mod_reading_' + id).checked,
+      writing: document.getElementById('mod_writing_' + id).checked,
+      listening: document.getElementById('mod_listening_' + id).checked,
+      speaking: document.getElementById('mod_speaking_' + id).checked,
+      partial: document.getElementById('partial_' + id).checked
+    });
+  });
+  localStorage.setItem('goetheFleetData', JSON.stringify({ config: collectConfig(), users: users }));
+  log('💾 Configuration saved locally.', 'success');
+}
+function loadData(){
+  const saved = localStorage.getItem('goetheFleetData');
+  if (saved){
+    const data = JSON.parse(saved); const c = data.config || {};
+    document.getElementById('targetUrl').value = c.targetUrl || '';
+    setEngine(c.browserType || 'edge');
+    document.getElementById('customBrowserPath').value = c.customBrowserPath || '';
+    if (c.maxBrowsers) document.getElementById('maxBrowsers').value = c.maxBrowsers;
+    if (c.autoFocusPage !== undefined) document.getElementById('autoFocusPage').value = c.autoFocusPage;
+    if (c.autoRetry !== undefined) document.getElementById('autoRetry').checked = c.autoRetry;
+    document.getElementById('ccName').value = c.ccName || '';
+    document.getElementById('ccNum').value = c.ccNum || '';
+    document.getElementById('ccExp').value = c.ccExp || '';
+    document.getElementById('ccCvv').value = c.ccCvv || '';
+    document.getElementById('proxyMode').value = c.proxyMode || 'none';
+    document.getElementById('proxyList').value = c.proxyList || '';
+    document.getElementById('nordUser').value = c.nordUser || '';
+    document.getElementById('nordPass').value = c.nordPass || '';
+    if (c.nordCountries) document.querySelectorAll('.nord-country').forEach(function(el){ el.checked = c.nordCountries.indexOf(el.value) !== -1; });
+    toggleProxyUI();
+    document.getElementById('userTableBody').innerHTML = ''; userCount = -1;
+    if (data.users && data.users.length){
+      data.users.forEach(function(u){
+        addUser(); const id = userCount;
+        document.getElementById('email_' + id).value = u.email || '';
+        document.getElementById('pass_' + id).value = u.pass || '';
+        document.getElementById('mod_reading_' + id).checked = u.reading;
+        document.getElementById('mod_writing_' + id).checked = u.writing;
+        document.getElementById('mod_listening_' + id).checked = u.listening;
+        document.getElementById('mod_speaking_' + id).checked = u.speaking;
+        document.getElementById('partial_' + id).checked = u.partial;
+      });
+    } else { addUser(); }
+    log('📂 Saved config loaded.', 'info');
+  } else { addUser(); }
+  renderDrones(); validateForm(); refreshStats();
+}
+</script>
+
+<script>
+/* ---------- START / STOP ---------- */
+async function startFleet(){
+  try{ _audioCtx = _audioCtx || new (window.AudioContext || window.webkitAudioContext)(); if (_audioCtx.state === 'suspended') _audioCtx.resume(); }catch(e){}
+
+  const mode = document.getElementById('proxyMode').value;
+  const maxB = parseInt(document.getElementById('maxBrowsers').value) || 1;
+
+  if (mode === 'custom'){
+    const lines = document.getElementById('proxyList').value.split('\n').filter(function(l){ return l.trim() && !l.trim().startsWith('#'); });
+    if (lines.length === 0){ alert('Custom Proxy mode is on but no proxies are pasted.'); return; }
+    if (lines.length < maxB && !confirm('You have ' + lines.length + ' proxies but ' + maxB + ' drones. Some will share IPs. Continue?')) return;
+  }
+  if (mode === 'nordvpn'){
+    if (!document.getElementById('nordUser').value.trim() || !document.getElementById('nordPass').value.trim()){ alert('NordVPN mode needs your Service Username and Password.'); return; }
+    if (document.querySelectorAll('.nord-country:checked').length === 0){ alert('Select at least one NordVPN country.'); return; }
+  }
+
+  const btn = document.getElementById('btnStart');
+  btn.disabled = true; btn.textContent = '⚙️ Swarm Active…';
+
+  const payload = buildPayload();
+
+  try{
+    const res = await fetch(API_URL + '/start', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+    const data = await res.json();
+    log('🚀 Swarm launched: ' + data.drones + ' drones, ' + data.proxies + ' proxies.', 'success');
+    document.getElementById('liveDot').classList.add('on');
+  }catch(err){
+    log('❌ Cannot reach the server. Is it running? (node server.js)', 'error');
+    btn.disabled = false; btn.textContent = '▶ Ignite Swarm';
+  }
+}
+
+async function emergencyStop(){
+  try{ await fetch(API_URL + '/stop', { method:'POST' }); }
+  catch(err){ log('❌ Failed to send stop signal.', 'error'); }
+}
+
+async function focusDrone(id){
+  try{ await fetch(API_URL + '/focus-drone/' + id, { method:'POST' }); log('🔍 Focused Drone ' + id + ' (others minimized).', 'info'); }
+  catch(err){ log('❌ Focus request failed.', 'error'); }
+}
+async function restoreAll(){
+  try{ await fetch(API_URL + '/restore-all', { method:'POST' }); log('🪟 Restored all drone windows.', 'info'); }
+  catch(err){ log('❌ Restore request failed.', 'error'); }
+}
+async function killDrone(id){
+  if (!confirm('Kill Drone ' + id + '? If it just booked a user, a fresh drone will take the next queued user.')) return;
+  try{ await fetch(API_URL + '/kill-drone/' + id, { method:'POST' }); log('🗙 Killed Drone ' + id + '.', 'warn'); }
+  catch(err){ log('❌ Kill request failed.', 'error'); }
+}
+async function startSingleDrone(id){
+  try{
+    const r = await fetch(API_URL + '/start-drone/' + id, { method:'POST' });
+    if (r.ok) log('➕ Started Drone ' + id + ' (others unaffected).', 'success');
+    else { const d = await r.json(); log('⚠️ ' + (d.error || 'Could not start drone'), 'warn'); }
+  }catch(err){ log('❌ Start-drone request failed.', 'error'); }
+}
+
+async function markOtpComplete(id){
+  document.getElementById('otpBtn_' + id).style.display = 'none';
+  const b = document.getElementById('userStatusBadge_' + id);
+  b.textContent = '🏆 Booked!'; b.style.background = 'color-mix(in srgb,var(--success) 22%,transparent)'; b.style.borderColor = 'var(--success)';
+  refreshStats();
+  try{ await fetch(API_URL + '/mark-complete', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ userIndex: id }) }); }
+  catch(err){}
+}
+</script>
+
+<script>
+/* ---------- LIVE STREAM ---------- */
+function setupLiveStream(){
+  const es = new EventSource(API_URL + '/stream');
+  es.onmessage = function(event){
+    const data = JSON.parse(event.data);
+
+    if (data.action === 'log') log(data.message, data.type);
+
+    if (data.action === 'updateUser'){
+      const badge = document.getElementById('userStatusBadge_' + data.index);
+      if (badge){ badge.textContent = data.status; badge.style.background = 'color-mix(in srgb,' + (data.color || 'var(--brand)') + ' 22%,transparent)'; }
+      if (data.requireAction){ const ob = document.getElementById('otpBtn_' + data.index); if (ob) ob.style.display = 'inline-block'; }
+      if (data.droneId){
+        const du = document.getElementById('dUser_' + data.droneId);
+        if (du) du.textContent = data.email || ('User ' + (data.index + 1));
+      }
+      refreshStats();
+    }
+
+    if (data.action === 'botUpdate'){
+      const st = document.getElementById('dStatus_' + data.droneId);
+      if (st) st.textContent = data.message;
+      const card = document.getElementById('drone_' + data.droneId);
+      if (card) card.dataset.active = '1';
+      if (data.email){ const du = document.getElementById('dUser_' + data.droneId); if (du) du.textContent = data.email; }
+      if (data.page && PAGE_INFO[data.page]){
+        const info = PAGE_INFO[data.page];
+        if (card){ card.style.boxShadow = 'inset 4px 0 0 ' + info.color + ', var(--shadow)'; }
+        const pb = document.getElementById('dPage_' + data.droneId);
+        if (pb){ pb.textContent = info.label; pb.style.background = 'color-mix(in srgb,' + info.color + ' 22%,transparent)'; pb.style.color = info.color; }
+        if (_lastPage[data.droneId] !== data.page){
+          _lastPage[data.droneId] = data.page;
+          if (data.page === 'options'){ notifyOptions(); log('🔔 Drone ' + data.droneId + ' reached OPTIONS page!', 'warn'); }
+          if (data.page === 'payment'){ notifyPayment(); log('🔔 Drone ' + data.droneId + ' reached PAYMENT page!', 'success'); }
+        }
+      }
+    }
+
+    if (data.action === 'droneUpdate'){
+      const st = document.getElementById('dStatus_' + data.droneId);
+      if (st) st.textContent = data.status;
+      const px = document.getElementById('dProxy_' + data.droneId);
+      if (px) px.textContent = data.proxy || 'Direct';
+      if (data.user === null){ const du = document.getElementById('dUser_' + data.droneId); if (du) du.textContent = '—'; }
+      const pb = document.getElementById('dPage_' + data.droneId);
+      if (pb){ pb.textContent = '·'; pb.style.background = 'var(--glass-hi)'; pb.style.color = 'var(--muted)'; }
+      const card = document.getElementById('drone_' + data.droneId);
+      if (card) card.style.boxShadow = '';
+      _lastPage[data.droneId] = null;
+    }
+
+    if (data.action === 'proxyStats' && data.proxyStats){
+      document.getElementById('proxyPillTxt').textContent = data.proxyStats.available + '/' + data.proxyStats.total + ' (' + data.proxyStats.burned + ' burned)';
+    }
+
+    if (data.action === 'fleetStopped' || data.action === 'fleetFinished'){
+      const btn = document.getElementById('btnStart');
+      btn.disabled = false; btn.textContent = '▶ Ignite Swarm';
+      document.getElementById('liveDot').classList.remove('on');
+      document.querySelectorAll('.drone').forEach(function(c){ c.dataset.active = '0'; c.style.boxShadow = ''; });
+      document.querySelectorAll('[id^=dStatus_]').forEach(function(s){ s.textContent = 'Docked'; });
+      document.querySelectorAll('[id^=dUser_]').forEach(function(u){ u.textContent = '—'; });
+      document.querySelectorAll('[id^=dPage_]').forEach(function(p){ p.textContent = '·'; p.style.background = 'var(--glass-hi)'; p.style.color = 'var(--muted)'; });
+      if (data.action === 'fleetFinished'){ notifyPayment(); log('🏆 All users processed. Mission complete.', 'success'); }
+    }
+
+    // live drone count
+    document.getElementById('statDrones').textContent = document.querySelectorAll('.drone[data-active="1"]').length;
+  };
+  es.onerror = function(){};
+}
+
+/* ---------- INIT ---------- */
+analyzeHardware();
+window.addEventListener('load', function(){
+  loadData();
+  setupLiveStream();
+  log('Fleet Commander ready. Awaiting orders…', 'info');
+});
+</script>
+
+
+<script>
+/* ---------- SHARED PAYLOAD BUILDER ---------- */
+function buildPayload(){
+  const mode = document.getElementById('proxyMode').value;
+  const maxB = parseInt(document.getElementById('maxBrowsers').value) || 1;
+  const config = {
+    targetUrl: document.getElementById('targetUrl').value.trim(),
+    browserType: _engine,
+    customBrowserPath: document.getElementById('customBrowserPath').value.trim(),
+    maxBrowsers: maxB,
+    autoFocusPage: document.getElementById('autoFocusPage').value,
+    autoRetry: document.getElementById('autoRetry').checked,
+    creditCard: {
+      name: document.getElementById('ccName').value.trim(),
+      num: document.getElementById('ccNum').value.trim(),
+      exp: document.getElementById('ccExp').value.trim(),
+      cvv: document.getElementById('ccCvv').value.trim()
+    }
+  };
+  const users = [];
+  document.querySelectorAll('#userTableBody tr').forEach(function(row){
+    const id = row.id.split('_')[1];
+    const email = document.getElementById('email_' + id).value.trim();
+    const pass = document.getElementById('pass_' + id).value;
+    if (email && pass){
+      const modules = [];
+      if (document.getElementById('mod_reading_' + id).checked) modules.push('reading');
+      if (document.getElementById('mod_writing_' + id).checked) modules.push('writing');
+      if (document.getElementById('mod_listening_' + id).checked) modules.push('listening');
+      if (document.getElementById('mod_speaking_' + id).checked) modules.push('speaking');
+      users.push({ email: email, pass: pass, modules: modules, partial: document.getElementById('partial_' + id).checked });
+    }
+  });
+  const payload = { config: config, users: users, proxyMode: mode };
+  if (mode === 'custom') payload.proxyList = document.getElementById('proxyList').value;
+  if (mode === 'nordvpn') payload.nordvpn = {
+    username: document.getElementById('nordUser').value.trim(),
+    password: document.getElementById('nordPass').value.trim(),
+    countries: Array.from(document.querySelectorAll('.nord-country:checked')).map(function(el){ return el.value; })
+  };
+  return payload;
+}
+
+/* ---------- CONFIG: SERVER PERSIST ---------- */
+async function saveConfigServer(){
+  try{
+    const body = { config: collectConfig(), users: gatherUsers() };
+    await fetch(API_URL + '/save-config', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    log('☁️ Configuration saved to server (survives restarts).', 'success');
+  }catch(e){ log('❌ Server save failed.', 'error'); }
+}
+async function loadConfigServer(){
+  try{
+    const r = await fetch(API_URL + '/load-config');
+    const d = await r.json();
+    if (d.found && d.config){
+      localStorage.setItem('goetheFleetData', JSON.stringify(d.config));
+      loadData();
+      log('☁️ Loaded configuration from server.', 'success');
+    }
+  }catch(e){}
+}
+function gatherUsers(){
+  const users = [];
+  document.querySelectorAll('#userTableBody tr').forEach(function(row){
+    const id = row.id.split('_')[1];
+    users.push({
+      email: document.getElementById('email_' + id).value,
+      pass: document.getElementById('pass_' + id).value,
+      reading: document.getElementById('mod_reading_' + id).checked,
+      writing: document.getElementById('mod_writing_' + id).checked,
+      listening: document.getElementById('mod_listening_' + id).checked,
+      speaking: document.getElementById('mod_speaking_' + id).checked,
+      partial: document.getElementById('partial_' + id).checked
+    });
+  });
+  return users;
+}
+</script>
+
+<script>
+/* ---------- CONFIG: IMPORT / EXPORT ---------- */
+function exportConfig(){
+  const data = { config: collectConfig(), users: gatherUsers() };
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type:'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'fleet-config.json';
+  a.click();
+  log('⬇️ Configuration exported.', 'info');
+}
+function importConfig(ev){
+  const file = ev.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(e){
+    try{
+      const data = JSON.parse(e.target.result);
+      localStorage.setItem('goetheFleetData', JSON.stringify(data));
+      loadData();
+      log('⬆️ Configuration imported.', 'success');
+    }catch(err){ log('❌ Invalid config file.', 'error'); }
+  };
+  reader.readAsText(file);
+  ev.target.value = '';
+}
+
+/* ---------- BOOKING HISTORY ---------- */
+function downloadHistory(){
+  window.open(API_URL + '/history', '_blank');
+}
+
+/* ---------- SCHEDULED START ---------- */
+async function armSchedule(){
+  const val = document.getElementById('scheduleAt').value;
+  const hint = document.getElementById('scheduleHint');
+  if (!val){
+    // clear schedule
+    try{ await fetch(API_URL + '/schedule-start', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ startAt: null }) }); }catch(e){}
+    hint.textContent = 'Schedule cleared.';
+    return;
+  }
+  const target = new Date(val).getTime();
+  if (target <= Date.now()){ alert('Pick a time in the future.'); return; }
+
+  // validate we have data to launch
+  if (!document.getElementById('targetUrl').value.trim()){ alert('Add the exam URL first.'); return; }
+
+  const payload = buildPayload();
+  payload.startAt = new Date(val).toISOString();
+  try{
+    await fetch(API_URL + '/schedule-start', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+    hint.textContent = '⏰ Armed for ' + new Date(target).toLocaleString();
+    log('⏰ Swarm armed for ' + new Date(target).toLocaleString(), 'success');
+  }catch(e){ log('❌ Could not arm schedule.', 'error'); }
+}
+
+/* ---------- ADD SINGLE DRONE ---------- */
+function addDronePrompt(){
+  const id = prompt('Start which drone number? (a free ID not already running)');
+  if (!id) return;
+  const n = parseInt(id);
+  if (isNaN(n) || n < 1){ alert('Enter a valid drone number.'); return; }
+  // make sure a card exists for it
+  const max = parseInt(document.getElementById('maxBrowsers').value) || 1;
+  if (n > max){ document.getElementById('maxBrowsers').value = n; renderDrones(); }
+  startSingleDrone(n);
+}
+</script>
+</body>
+</html>

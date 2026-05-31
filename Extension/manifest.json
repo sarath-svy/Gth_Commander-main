@@ -1,0 +1,40 @@
+{
+"manifest_version": 3,
+"name": "Goethe Hunter Drone",
+"version": "3.0",
+"permissions": [
+  "activeTab",
+  "scripting",
+  "storage"
+],
+"host_permissions": [
+  "https://www.goethe.de/*",
+  "https://login.goethe.de/*",
+  "https://*.paymentiq.io/*",
+  "http://localhost:3000/*",
+  "http://127.0.0.1:3000/*"
+],
+"content_scripts": [
+  {
+    "matches": [
+      "https://www.goethe.de/*",
+      "https://login.goethe.de/*",
+      "https://*.paymentiq.io/*"
+    ],
+    "js": ["fingerprint.js"],
+    "run_at": "document_start",
+    "all_frames": true,
+    "world": "MAIN"
+  },
+  {
+    "matches": [
+      "https://www.goethe.de/*",
+      "https://login.goethe.de/*",
+      "https://*.paymentiq.io/*"
+    ],
+    "js": ["content.js"],
+    "run_at": "document_idle",
+    "all_frames": true
+  }
+]
+}
