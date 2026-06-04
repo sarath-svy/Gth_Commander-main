@@ -1,6 +1,11 @@
 const API_URL = "http://127.0.0.1:3000/api";
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// While a drone holds during warm-up, refresh the page roughly every 2–3 min so
+// the goethe session/cookies don't go stale on long waits. The jitter (random
+// per page load) staggers drones so they don't all reload at the same instant.
+const WARMUP_REFRESH_MS = 120000 + Math.floor(Math.random() * 60000);
+
 // ==========================================
 // THE SURGICAL MODULE FINDER (Untouched)
 // ==========================================
@@ -157,6 +162,19 @@ async function reportStatus(droneId, message, page) {
    } catch(e) {}
 }
 
+// Has the scheduled automation-start time arrived? Drones warm up (load the
+// page) immediately but only start clicking/booking once this returns live.
+// Fail-open: any server/endpoint problem returns live so we never block.
+async function checkGoLive() {
+   try {
+       const r = await fetch(`${API_URL}/go-status`);
+       if (!r.ok) return { live: true };
+       return await r.json();
+   } catch (e) {
+       return { live: true };
+   }
+}
+
 // Detect which logical page we're on (for the dashboard page-status highlight)
 function detectPage() {
    const url = window.location.href.toLowerCase();
@@ -190,6 +208,28 @@ async function runAutomationCycle() {
       acceptCookieBanner();
 
       const currentUrl = window.location.href.toLowerCase();
+
+      // ---------------------------------------------------------
+      // WARM-UP GATE: if a scheduled automation-start time is set, the drone
+      // has loaded the page (warm: proxy connected, session live, cookies
+      // dismissed) but must HOLD — no clicking, grabbing or booking — until
+      // the server says GO. Without a scheduled time this is a no-op.
+      // ---------------------------------------------------------
+      const go = await checkGoLive();
+      if (!go.live) {
+          // Keep the session fresh on long holds: reload once this page has been
+          // sitting past the (jittered) refresh window — but NOT in the final 20s
+          // before go-time, so the drone is settled and ready to fire instantly.
+          const msUntilGo = go.startAt ? (go.startAt - Date.now()) : Infinity;
+          if (performance.now() >= WARMUP_REFRESH_MS && msUntilGo > 20000) {
+              reportStatus(state.fleetDroneId, "🔄 Warm-up refresh — keeping session fresh…", detectPage());
+              window.location.reload();
+              return;
+          }
+          reportStatus(state.fleetDroneId, `🕒 Warmed up — holding for automation start (${go.startLabel || 'scheduled'})`, detectPage());
+          setTimeout(runAutomationCycle, 1000);
+          return;
+      }
 
       // ---------------------------------------------------------
       // DOM SNIFFER 1: CREDIT CARD FIELDS (Inner Iframe) - UNTOUCHED

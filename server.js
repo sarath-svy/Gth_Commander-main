@@ -26,7 +26,8 @@ let fleetState = {
     activeDrones: {},
     proxyPool: [],         // Available proxies
     burnedProxies: [],     // Rate-limited proxies
-    proxyMode: 'none'      // 'none' | 'custom' | 'nordvpn'
+    proxyMode: 'none',     // 'none' | 'custom' | 'nordvpn'
+    automationStartAt: null // ms timestamp: drones warm up but DON'T click/book until this time (null = act immediately)
 };
 
 const SEED_PROFILE_PATH = path.resolve(__dirname, 'SeedProfile');
@@ -79,6 +80,31 @@ function applySignInBlockPolicy(browserType) {
         cmds.push(`reg add "${base}" /v NonRemovableProfileEnabled /t REG_DWORD /d 0 /f`);
         cmds.push(`reg add "${base}" /v ConfigureDoNotTrack /t REG_DWORD /d 1 /f`);
     }
+    cmds.forEach(c => { try { exec(c, { shell: true }); } catch (e) {} });
+}
+
+// ==========================================
+// SUPPRESS THE LOCAL NETWORK ACCESS PROMPT (Chrome/Edge v142+)
+// Our content script on the goethe.de page calls http://127.0.0.1:3000. Since
+// Chrome/Edge 142 (Oct 2025), a public site reaching localhost/private IPs is
+// gated behind a one-time "<site> wants to access other apps and services on
+// this device" permission. Each drone uses a FRESH temp profile, so the grant
+// is never remembered and it re-prompts every launch, stalling the bot until
+// someone clicks Allow.
+// We pre-grant it for every origin via enterprise policy:
+//   LocalNetworkAccessAllowedForUrls = ["*"]  (all origins allowed, no prompt)
+//   LocalNetworkAccessRestrictionsEnabled = 1 (so the allowlist is enforced)
+// (The matching launch flag --disable-features=LocalNetworkAccessChecks is a
+// belt-and-suspenders backup added in launchDrone.)
+function applyLocalNetworkAccessPolicy(browserType) {
+    const base = browserType === 'edge'
+        ? 'HKCU\\Software\\Policies\\Microsoft\\Edge'
+        : 'HKCU\\Software\\Policies\\Google\\Chrome';
+    const allowlist = JSON.stringify(['*']).replace(/"/g, '\\"');
+    const cmds = [
+        `reg add "${base}" /v LocalNetworkAccessAllowedForUrls /t REG_SZ /d "${allowlist}" /f`,
+        `reg add "${base}" /v LocalNetworkAccessRestrictionsEnabled /t REG_DWORD /d 1 /f`
+    ];
     cmds.forEach(c => { try { exec(c, { shell: true }); } catch (e) {} });
 }
 
@@ -326,7 +352,13 @@ function buildProxyArg(proxy) {
     if (!proxy) return [];
     // Chrome accepts: --proxy-server="socks5://host:port" or --proxy-server="http://host:port"
     const proxyUrl = `${proxy.protocol}://${proxy.host}:${proxy.port}`;
-    return [`--proxy-server="${proxyUrl}"`];
+    // Keep loopback direct here too (the relay path already does this). Without
+    // it, a fallback to this path would tunnel the drone's localhost API calls
+    // through the proxy and stall the options page.
+    return [
+        `--proxy-server="${proxyUrl}"`,
+        `--proxy-bypass-list="<-loopback>;localhost;127.0.0.1"`
+    ];
 }
 
 function assassinateDrone(droneId) {
@@ -433,7 +465,10 @@ function resolveBrowserExe() {
         sysLog(`❌ CloakBrowser selected but binary not found. Install it (pip install cloakbrowser && python -m cloakbrowser install) or paste its chrome.exe path in the dashboard.`, 'error');
         return null;
     }
-    if (custom) {
+    // A custom path only applies to the Chrome engine (e.g. Chrome for Testing).
+    // Edge always uses the installed msedge.exe; cloak is handled above. Without
+    // this guard, a leftover Cloak/Chrome path would hijack an Edge launch.
+    if (custom && fleetState.config.browserType === 'chrome') {
         if (fs.existsSync(custom)) return custom;
         sysLog(`⚠️ Custom browser path not found: ${custom}. Falling back to installed browser.`, 'warn');
     }
@@ -615,7 +650,9 @@ async function launchDrone(droneId) {
             `--load-extension=${EXTENSION_PATH}`,
             `--disable-extensions-except=${EXTENSION_PATH}`,
             // Chrome 137-141 workaround (removed in 142+, harmless on Edge).
-            `--disable-features=DisableLoadExtensionCommandLineSwitch,msImplicitSignin,msEdgeImplicitSignin,msEdgeIdentityFlows,EdgeOpenWithSignIn,AutofillEnableAccountWalletStorage,msEdgeWelcomePage`,
+            // LocalNetworkAccessChecks: backup for the v142+ "access other apps
+            // and services on this device" prompt our localhost calls trigger.
+            `--disable-features=DisableLoadExtensionCommandLineSwitch,msImplicitSignin,msEdgeImplicitSignin,msEdgeIdentityFlows,EdgeOpenWithSignIn,AutofillEnableAccountWalletStorage,msEdgeWelcomePage,LocalNetworkAccessChecks,LocalNetworkAccessChecksWebSockets`,
             // Stop the browser from auto signing-in to a Microsoft/Google
             // account and syncing — this is why every window showed the same
             // logged-in user. These force a clean, anonymous profile.
@@ -698,6 +735,32 @@ function daemonSend(cmd) {
     try { windowDaemon.stdin.write(cmd + '\n'); } catch (e) {}
 }
 
+// ==========================================
+// KEEP-AWAKE (prevent PC sleep / screen-lock while the swarm runs)
+// A small PowerShell guard holds Windows' execution-state flag. Killing it (on
+// stop or server exit) auto-restores the user's normal sleep behaviour — no
+// global power settings are touched.
+// ==========================================
+let keepAwakeProc = null;
+function preventSleep() {
+    if (keepAwakeProc) return; // already on
+    try {
+        const scriptPath = path.join(__dirname, 'keepAwake.ps1');
+        keepAwakeProc = spawn('powershell',
+            ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath, '-ParentPid', String(process.pid)],
+            { shell: false, stdio: 'ignore' });
+        keepAwakeProc.on('error', () => { keepAwakeProc = null; });
+        keepAwakeProc.on('exit', () => { keepAwakeProc = null; });
+        sysLog('☕ Keep-awake ON — PC won’t sleep or lock while the swarm runs.', 'info');
+    } catch (e) { keepAwakeProc = null; }
+}
+function allowSleep() {
+    if (!keepAwakeProc) return;
+    try { keepAwakeProc.kill(); } catch (e) {}
+    keepAwakeProc = null;
+    sysLog('💤 Keep-awake OFF — normal sleep/lock behaviour restored.', 'info');
+}
+
 // Bring one drone's window to the front and minimize the others (instant).
 function focusDroneWindows(focusId) {
     const exeName = droneExeName();
@@ -762,8 +825,27 @@ async function igniteSwarm(body) {
     fleetState.burnedProxies = [];
     autoRetryFailed = !!(body.config && body.config.autoRetry);
 
+    // Two-phase launch: browsers open NOW (warm up + sit on the landing page),
+    // but the drones don't start clicking/booking until automationStartAt.
+    // null/past time = act immediately (original behaviour).
+    const autoAt = body.automationStartAt ? new Date(body.automationStartAt).getTime() : null;
+    fleetState.automationStartAt = (autoAt && autoAt > Date.now()) ? autoAt : null;
+    if (fleetState.automationStartAt) {
+        const secs = Math.round((fleetState.automationStartAt - Date.now()) / 1000);
+        sysLog(`⏳ Drones will warm up and HOLD; automation starts at ${new Date(fleetState.automationStartAt).toLocaleString()} (in ~${secs}s).`, 'info');
+        setTimeout(() => {
+            if (fleetState.isRunning) {
+                sysLog('🚦 GO! Automation start time reached — drones are now booking.', 'success');
+                pushToDashboard('automationLive', { startAt: fleetState.automationStartAt });
+            }
+        }, fleetState.automationStartAt - Date.now());
+    }
+
     // Block Microsoft/Google auto sign-in + sync for this browser type
     applySignInBlockPolicy(fleetState.config.browserType || 'edge');
+    // Stop the "wants to access other apps and services" Local Network Access
+    // prompt (v142+) from stalling the flow when the content script calls localhost.
+    applyLocalNetworkAccessPolicy(fleetState.config.browserType || 'edge');
 
     // Setup proxy pool
     if (fleetState.proxyMode === 'custom' && body.proxyList) {
@@ -781,6 +863,7 @@ async function igniteSwarm(body) {
     }
 
     sysLog("🔥 SWARM IGNITION ACTIVATED", "warn");
+    preventSleep(); // keep the PC awake for the whole run
     broadcastProxyStats();
     startHeartbeat();
 
@@ -797,6 +880,18 @@ app.post('/api/start', async (req, res) => {
     if (fleetState.isRunning) return res.status(400).json({ error: "Fleet already running" });
     const result = await igniteSwarm(req.body);
     res.json({ status: "success", ...result });
+});
+
+// --- GO STATUS (extension polls this to know if it may start booking yet) ---
+// Fail-open by design: if automationStartAt is unset, drones act immediately.
+app.get('/api/go-status', (req, res) => {
+    const startAt = fleetState.automationStartAt || null;
+    const live = !startAt || Date.now() >= startAt;
+    res.json({
+        live,
+        startAt,
+        startLabel: startAt ? new Date(startAt).toLocaleTimeString() : null
+    });
 });
 
 // --- SCHEDULED START (arm the swarm to launch at a specific time) ---
@@ -827,7 +922,9 @@ app.post('/api/schedule-start', (req, res) => {
 app.post('/api/stop', (req, res) => {
     sysLog("🚨 EMERGENCY KILL SWITCH ENGAGED! Destroying swarm...", "error");
     fleetState.isRunning = false;
+    fleetState.automationStartAt = null;
     stopHeartbeat();
+    allowSleep(); // restore normal sleep/lock behaviour
     if (scheduledTimer) { clearTimeout(scheduledTimer); scheduledTimer = null; }
 
     const max = parseInt(fleetState.config.maxBrowsers) || 10;
@@ -1315,4 +1412,10 @@ app.listen(PORT, () => {
     console.log(`  🌐 Dashboard: http://localhost:${PORT}`);
     console.log(`  ⚠️  DO NOT use Live Server — open the URL above directly`);
     console.log(`${'='.repeat(50)}\n`);
+});
+
+// Release the keep-awake guard if the server is closed (Ctrl+C / kill), so the
+// PC isn't left awake. The guard also self-exits via its parent-PID watchdog.
+['SIGINT', 'SIGTERM', 'exit'].forEach(sig => {
+    process.on(sig, () => { try { allowSleep(); } catch (e) {} if (sig !== 'exit') process.exit(0); });
 });

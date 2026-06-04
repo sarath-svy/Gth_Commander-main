@@ -330,12 +330,17 @@ textarea.inp{resize:vertical;font-family:'Consolas',monospace;font-size:.82rem;l
           <label class="chip" style="width:100%"><input type="checkbox" id="autoRetry"> 🔁 Auto-retry failed logins <span style="color:var(--faint);font-size:.78rem">(tolerate transient errors, up to 2 tries)</span></label>
         </div>
         <div class="field">
-          <label class="lbl">⏰ Scheduled Start <span style="font-weight:400;color:var(--faint)">(leave blank to start manually)</span></label>
+          <label class="lbl">⏰ Scheduled Start <span style="font-weight:400;color:var(--faint)">(when the browsers OPEN — leave blank to launch manually)</span></label>
           <div class="row c2">
             <input type="datetime-local" id="scheduleAt" class="inp">
             <button class="btn btn-soft" onclick="armSchedule()">Arm Schedule</button>
           </div>
           <div class="hint" id="scheduleHint"></div>
+        </div>
+        <div class="field">
+          <label class="lbl">🚦 Automation Start <span style="font-weight:400;color:var(--faint)">(when drones START booking — blank = start immediately)</span></label>
+          <input type="datetime-local" id="automationAt" class="inp">
+          <div class="hint">Browsers open and warm up (page loaded, proxy connected, cookies cleared), then HOLD until this time before clicking/booking. Set this to the exact registration-open moment.</div>
         </div>
         <div class="note" id="chromeWarn" style="display:none;border-color:color-mix(in srgb,var(--danger) 40%,transparent)">
           ⚠️ <b>Chrome 137+ can't auto-load extensions.</b> Either use <b>Edge</b>, or download
@@ -897,6 +902,10 @@ function setupLiveStream(){
       document.getElementById('proxyPillTxt').textContent = data.proxyStats.available + '/' + data.proxyStats.total + ' (' + data.proxyStats.burned + ' burned)';
     }
 
+    if (data.action === 'automationLive'){
+      log('🚦 GO! Automation start time reached — drones are now booking.', 'success');
+    }
+
     if (data.action === 'fleetStopped' || data.action === 'fleetFinished'){
       const btn = document.getElementById('btnStart');
       btn.disabled = false; btn.textContent = '▶ Ignite Swarm';
@@ -958,6 +967,9 @@ function buildPayload(){
     }
   });
   const payload = { config: config, users: users, proxyMode: mode };
+  // Two-phase launch: hold booking until this moment (browsers still open now/at schedule).
+  const autoAt = document.getElementById('automationAt').value;
+  if (autoAt) payload.automationStartAt = new Date(autoAt).toISOString();
   if (mode === 'custom') payload.proxyList = document.getElementById('proxyList').value;
   if (mode === 'nordvpn') payload.nordvpn = {
     username: document.getElementById('nordUser').value.trim(),
