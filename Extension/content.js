@@ -334,7 +334,39 @@ async function runAutomationCycle() {
               method: 'POST', headers: {'Content-Type': 'application/json'},
               body: JSON.stringify({ droneId: state.fleetDroneId })
           });
-          return; 
+          return;
+      }
+
+      // --- STATE: BROWSER-LEVEL NETWORK / PROXY ERROR PAGE ---
+      // A flaky NordVPN/SOCKS server that drops the connection mid-flow shows a
+      // "no network connection" / "site can't be reached" page. This is NOT a
+      // login failure and NOT a rate-limit — it's a dead proxy. Burn it and
+      // rotate to a different server instead of blaming the user's credentials.
+      // (True chrome-error:// pages are caught by background.js; this catches
+      // HTML error pages served with a 200 by a CDN/relay.)
+      const looksOffline = pageText.includes('no network connection') ||
+                           pageText.includes('no internet') ||
+                           pageText.includes("site can’t be reached") ||
+                           pageText.includes("site can't be reached") ||
+                           pageText.includes('took too long to respond') ||
+                           pageText.includes('err_proxy_connection_failed') ||
+                           pageText.includes('err_tunnel_connection_failed') ||
+                           pageText.includes('err_socks_connection_failed') ||
+                           pageText.includes('err_connection_reset') ||
+                           pageText.includes('err_connection_closed') ||
+                           pageText.includes('err_connection_timed_out') ||
+                           pageText.includes('err_timed_out') ||
+                           pageText.includes('err_name_not_resolved') ||
+                           pageText.includes('err_internet_disconnected');
+      if (looksOffline) {
+          reportStatus(state.fleetDroneId, "📡 Network/proxy error — rotating IP...", 'wicket');
+          try {
+              await fetch(`${API_URL}/proxy-failed/${state.fleetDroneId}`, {
+                  method: 'POST', headers: {'Content-Type': 'application/json'},
+                  body: JSON.stringify({ reason: 'offline error page' })
+              });
+          } catch (e) {}
+          return; // server burns the proxy and respawns this drone on a new one
       }
 
       // --- STATE: EXAM ID (Landing Page) - UNTOUCHED ---
@@ -462,11 +494,16 @@ async function runAutomationCycle() {
           // the credentials were rejected. Report failure and STOP (no retry).
           if (state.login_attempted && !window.loginFailReported) {
               // Look for an error message OR simply the fact we're back on login
+              // Only treat this as a credential failure on EXPLICIT error text or
+              // the site's own specific error element. The previous broad
+              // [class*="error"] match fired on benign pages (and on proxy error
+              // pages), wrongly burning good users — removed on purpose.
               const errText = document.body.innerText.toLowerCase();
               const looksFailed = errText.includes('incorrect') || errText.includes('invalid') ||
                                   errText.includes('wrong') || errText.includes('falsch') ||
                                   errText.includes('not correct') || errText.includes('try again') ||
-                                  document.querySelector('.error, .cs-message--error, [class*="error"]');
+                                  errText.includes('ungültig') || errText.includes('anmeldung fehlgeschlagen') ||
+                                  document.querySelector('.cs-message--error');
               if (looksFailed) {
                   window.loginFailReported = true;
                   console.log("🔐 [State: Login] LOGIN FAILED. Reporting and stopping for this user.");

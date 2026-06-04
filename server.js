@@ -1086,6 +1086,47 @@ app.post('/api/report-429', (req, res) => {
     res.json({ status: "ok" });
 });
 
+// --- PROXY / NETWORK FAILURE (Extension or background watchdog detected a dead proxy) ---
+// A NordVPN/SOCKS server dropped the connection (the login redirect burst is
+// where this usually bites). The user's credentials are FINE — only the proxy
+// is bad. Requeue the user, burn this proxy so the next pick differs, and
+// respawn the drone on a fresh server. Self-healing IP rotation.
+app.post('/api/proxy-failed/:droneId', (req, res) => {
+    const { droneId } = req.params;
+    const reason = (req.body && req.body.reason) || 'network error';
+    const drone = fleetState.activeDrones[droneId];
+    if (!drone) return res.json({ status: "ok" }); // already handled/respawning
+
+    sysLog(`📡 Drone ${droneId} network/proxy failure (${reason}).`, 'error');
+
+    // Release the assigned user back to the queue — their login is valid.
+    if (drone.assignedUserIndex !== null && drone.assignedUserIndex !== undefined) {
+        const uIdx = drone.assignedUserIndex;
+        const u = fleetState.users[uIdx];
+        if (u && (u.status.startsWith('Running') || u.status === 'OTP_Wait')) {
+            u.status = 'Queued';
+            sysLog(`↩️ Releasing ${u.email} back to queue (proxy failed, not the user).`, 'warn');
+            pushToDashboard('updateUser', { index: uIdx, status: '⏳ Queued', color: '#334155' });
+        }
+    }
+
+    // Burn the failing proxy so getNextProxy() hands out a DIFFERENT server.
+    if (fleetState.proxyMode !== 'none' && drone.proxy) {
+        burnProxy(drone.proxy);
+        sysLog(`🔄 Drone ${droneId}: rotating to a different proxy server...`, 'warn');
+    }
+
+    assassinateDrone(droneId);
+    delete fleetState.activeDrones[droneId];
+    pushToDashboard('droneUpdate', { droneId, status: '📡 Network error — rotating IP...', proxy: 'Rotating...', user: null });
+
+    // Wait for the browser/relay to close, then relaunch on a fresh proxy.
+    if (fleetState.isRunning) {
+        setTimeout(() => { if (fleetState.isRunning) launchDrone(droneId); }, 5000);
+    }
+    res.json({ status: "ok" });
+});
+
 // --- OTP WAIT (Extension reached payment OTP stage) ---
 app.post('/api/otp-wait', (req, res) => {
     const { droneId } = req.body;

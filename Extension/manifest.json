@@ -5,8 +5,12 @@
 "permissions": [
   "activeTab",
   "scripting",
-  "storage"
+  "storage",
+  "webNavigation"
 ],
+"background": {
+  "service_worker": "background.js"
+},
 "host_permissions": [
   "https://www.goethe.de/*",
   "https://login.goethe.de/*",
