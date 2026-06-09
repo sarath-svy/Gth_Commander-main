@@ -6,6 +6,86 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 // per page load) staggers drones so they don't all reload at the same instant.
 const WARMUP_REFRESH_MS = 120000 + Math.floor(Math.random() * 60000);
 
+// Return the CLEAN exam URL — strip the params WE inject (fleetDroneId,
+// fleetSession, _cb) regardless of separator or order. The old split('&fleetDroneId')
+// silently failed when the param used a '?' separator (no query string in the
+// configured URL), leaving the drone/session ids glued onto every fetch + reload.
+function cleanExamUrl(href) {
+  try {
+    const u = new URL(href, location.origin);
+    ['fleetDroneId', 'fleetSession', '_cb'].forEach(p => u.searchParams.delete(p));
+    return u.toString();
+  } catch (e) {
+    return String(href).split(/[?&]fleetDroneId/)[0]; // best-effort fallback
+  }
+}
+
+// Force a FRESH (non-CDN-cached) load of the exam page. The Goethe page sits
+// behind Akamai; a plain location.reload() can keep getting served a stale
+// "not-open yet" copy for minutes after booking actually opens. A unique _cb
+// param changes the edge cache key so we always pull the live origin state.
+function refreshExamPage(state) {
+  const base = (state && state.exam_base_url) || cleanExamUrl(window.location.href);
+  const sep = base.includes('?') ? '&' : '?';
+  window.location.href = base + sep + '_cb=' + Date.now();
+}
+
+// Pull the server-rendered examButtonLink out of any page-HTML text.
+// Empty string => booking not open yet; a /coe?…&oid=… URL => open.
+function parseExamButtonLink(text) {
+  if (!text) return "";
+  const m = text.match(/examButtonLink['"]?\]?\s*=\s*["']([^"']*)["']/);
+  return m ? m[1].trim() : "";
+}
+
+// HTTP race path: fetch the exam page HTML directly (same-origin, so cookies
+// ride along) with a cache-buster, and parse out the link. This gets the link
+// WITHOUT waiting for a full page reload + content-script re-injection, so under
+// high traffic it usually beats the rendered button.
+// Returns { link, status, rateLimited }: link is "" until booking opens; a 429/
+// 503 sets rateLimited so the caller can back off and rotate IP.
+async function fetchExamLink(state) {
+  const base = (state && state.exam_base_url) || cleanExamUrl(window.location.href);
+  const sep = base.includes('?') ? '&' : '?';
+  const url = base + sep + '_cb=' + Date.now();
+  try {
+    const r = await fetch(url, { credentials: 'include', cache: 'no-store' });
+    if (r.status === 429 || r.status === 503) return { link: "", status: r.status, rateLimited: true };
+    if (!r.ok) return { link: "", status: r.status };
+    return { link: parseExamButtonLink(await r.text()), status: 200 };
+  } catch (e) {
+    return { link: "", status: 0, error: true };
+  }
+}
+
+// Consecutive HTTP 429/503 hits; drives exponential backoff + IP rotation.
+let rateLimitStreak = 0;
+// One-shot per page load: logs how long the page took to become actionable.
+let navLogged = false;
+// When this exam-page instance was first seen by the content script. Used to let
+// Akamai's bot sensor validate the session before we navigate to /coe (which
+// 403s on an unvalidated session). Resets to 0 on every page (re)load.
+let examFirstSeenAt = 0;
+const SESSION_SETTLE_MS = 2000;      // time-based settle when no cookie signal
+const SESSION_SETTLE_MAX_MS = 5000;  // hard cap — never wait longer than this
+
+// SMART session-ready check. Akamai's _abck bot cookie carries a status field
+// that flips from "-1" (sensor not posted yet → /coe will 403) to "0" (validated
+// → /coe works). We jump the INSTANT it reads "0". If _abck isn't readable (some
+// configs) we fall back to a time-based settle, and a hard cap guarantees we
+// never hang (the /coe retry net covers any residual edge case).
+function coeSessionReady() {
+  const elapsed = Date.now() - examFirstSeenAt;
+  if (elapsed >= SESSION_SETTLE_MAX_MS) return true;       // cap
+  const m = (document.cookie || '').match(/_abck=([^;]+)/);
+  if (m) {
+    const status = decodeURIComponent(m[1]).split('~')[1]; // 2nd field = validation status
+    if (status === '0')  return true;                      // validated → go NOW
+    if (status === '-1') return false;                     // not validated → keep waiting
+  }
+  return elapsed >= SESSION_SETTLE_MS;                      // no _abck signal → time settle
+}
+
 // ==========================================
 // THE SURGICAL MODULE FINDER (Untouched)
 // ==========================================
@@ -143,7 +223,7 @@ async function syncDroneState() {
                newState.fleetSession = urlSession;
                newState.fleetUser = null;
                newState.fleetCC = null;
-               newState.exam_base_url = window.location.href.split('&fleetDroneId')[0];
+               newState.exam_base_url = cleanExamUrl(window.location.href);
                chrome.storage.local.set(newState, () => resolve(newState));
            } else {
                resolve(newState);
@@ -162,6 +242,43 @@ async function reportStatus(droneId, message, page) {
    } catch(e) {}
 }
 
+// Push a milestone into the dashboard's GLOBAL system log feed (sysLog), in
+// addition to the per-drone status row. Use for meaningful events only — link
+// acquired, rate-limited, IP rotation — NOT every poll (keeps the feed clean).
+async function droneLog(droneId, message, type) {
+   if (!droneId) return;
+   try {
+       await fetch(`${API_URL}/drone-log`, {
+           method: 'POST', headers: {'Content-Type': 'application/json'},
+           body: JSON.stringify({ droneId, message, type: type || 'info' })
+       });
+   } catch(e) {}
+}
+
+// Pull the booking link the SERVER's direct-IP hunter found (fast path). The
+// server is usually first because it polls over a direct, low-latency line
+// while drones go through NordVPN SOCKS. Returns "" until the server has it.
+async function fetchServerExamLink() {
+   try {
+       const r = await fetch(`${API_URL}/exam-link`, { cache: 'no-store' });
+       if (!r.ok) return "";
+       const j = await r.json();
+       return (j && j.link) ? j.link : "";
+   } catch (e) { return ""; }
+}
+
+// Share a link THIS drone found back to the server so every other drone uses it
+// (and the server stops its own polling). "whoever gets it first wins."
+async function reportFoundLink(droneId, link, via) {
+   if (!droneId || !link) return;
+   try {
+       await fetch(`${API_URL}/found-link`, {
+           method: 'POST', headers: {'Content-Type': 'application/json'},
+           body: JSON.stringify({ droneId, link, via: via || 'fetch' })
+       });
+   } catch (e) {}
+}
+
 // Has the scheduled automation-start time arrived? Drones warm up (load the
 // page) immediately but only start clicking/booking once this returns live.
 // Fail-open: any server/endpoint problem returns live so we never block.
@@ -173,6 +290,27 @@ async function checkGoLive() {
    } catch (e) {
        return { live: true };
    }
+}
+
+// Per-drone bot control: is this drone paused (manually, or auto at a page), and
+// which page is it configured to auto-pause at? Fail-open so a server hiccup
+// never freezes a drone.
+async function getDroneControl(droneId) {
+   try {
+       const r = await fetch(`${API_URL}/drone-control/${droneId}`);
+       if (!r.ok) return { paused: false };
+       return await r.json();
+   } catch (e) {
+       return { paused: false };
+   }
+}
+async function requestPause(droneId, page, manual) {
+   try {
+       await fetch(`${API_URL}/pause-drone/${droneId}`, {
+           method: 'POST', headers: { 'Content-Type': 'application/json' },
+           body: JSON.stringify({ page: page || null, manual: !!manual })
+       });
+   } catch (e) {}
 }
 
 // Detect which logical page we're on (for the dashboard page-status highlight)
@@ -198,9 +336,156 @@ async function runAutomationCycle() {
       
       if (!state.fleetDroneId) return; // If there is no drone ID, this browser wasn't launched by the Swarm. Ignore it.
 
-      if (document.readyState !== 'complete') {
-          setTimeout(runAutomationCycle, 500);
+      // =========================================================
+      // EXAM-ID FAST PATH — owns the landing page entirely, BEFORE the page-load
+      // wait. No "Select modules" button, no reload: the drone races (a) the
+      // server-distributed link and (b) its own direct fetch, and navigates to the
+      // selection page the instant EITHER yields the link. Gated to examId so the
+      // booking flow (coe/options/payment) is never disturbed.
+      // =========================================================
+      if (window.location.href.toLowerCase().includes('examid')) {
+
+          // 1) QUEUE COOLDOWN — after a wicket/queue hit we MUST wait before
+          //    retrying (anti-rate-limit). Survives the navigation via storage.
+          if (state.wicket_timeout) {
+              if (Date.now() < state.wicket_timeout) {
+                  const left = Math.ceil((state.wicket_timeout - Date.now()) / 1000);
+                  reportStatus(state.fleetDroneId, `⏳ Queue cooldown — retry in ${left}s`, 'wicket');
+                  setTimeout(runAutomationCycle, 1000);
+                  return;
+              }
+              await chrome.storage.local.remove('wicket_timeout'); // expired → clear, then retry
+              droneLog(state.fleetDroneId, "↩️ Queue cooldown done — retrying", 'info');
+          }
+
+          // Fresh attempt from the exam page → clear any /coe 403-retry counter.
+          if (state.coe_forbidden_tries) { await chrome.storage.local.remove('coe_forbidden_tries'); }
+
+          // Mark when we first landed on this exam-page instance (for the session
+          // settle gate before /coe). Set once per page load.
+          if (examFirstSeenAt === 0) examFirstSeenAt = Date.now();
+
+          // 2) GO-LIVE GATE — hold until booking-open time (no early hammering).
+          const go = await checkGoLive();
+          if (!go.live) {
+              const msUntilGo = go.startAt ? (go.startAt - Date.now()) : Infinity;
+              if (performance.now() >= WARMUP_REFRESH_MS && msUntilGo > 20000) {
+                  reportStatus(state.fleetDroneId, "🔄 Warm-up refresh — keeping session fresh…", 'landing');
+                  refreshExamPage(state);
+                  return;
+              }
+              reportStatus(state.fleetDroneId, `🕒 Warmed up — holding for start (${go.startLabel || 'scheduled'})`, 'landing');
+              setTimeout(runAutomationCycle, 1000);
+              return;
+          }
+
+          // 3) MANUAL PAUSE — respect a dashboard pause.
+          if (window.self === window.top) {
+              const ctrl = await getDroneControl(state.fleetDroneId);
+              if (ctrl.paused) {
+                  reportStatus(state.fleetDroneId, "⏸ Paused — press Continue on the dashboard", 'landing');
+                  setTimeout(runAutomationCycle, 1200);
+                  return;
+              }
+          }
+
+          // SESSION GATE — don't navigate to /coe until Akamai has validated the
+          // session (else /coe 403s). Smart: jumps the instant the _abck cookie
+          // flips to validated; warm-up satisfies it long before go-live (0 delay).
+          const sessionSettled = coeSessionReady();
+
+          // 4) RACE — server link (instant, localhost) first, then this drone's own
+          //    direct fetch. Navigate the moment either yields the selection link.
+          const serverLink = await fetchServerExamLink();
+          if (serverLink) {
+              if (!sessionSettled) {
+                  reportStatus(state.fleetDroneId, "⏳ Link ready — validating session before selection…", 'landing');
+                  setTimeout(runAutomationCycle, 200);
+                  return;
+              }
+              rateLimitStreak = 0;
+              reportStatus(state.fleetDroneId, "🟢 Selection link (shared) — navigating…", 'landing');
+              droneLog(state.fleetDroneId, "🎯 [Shared] Using link from server/other drone — navigating", 'success');
+              window.location.href = serverLink;
+              return;
+          }
+          const res = await fetchExamLink(state);
+          droneLog(state.fleetDroneId,
+              `🌐 [HTTP fetch] examId page → HTTP ${res.status || 'ERR'}` +
+              (res.link ? ' — LINK FOUND' : (res.rateLimited ? ' rate-limited' : ' not open yet')),
+              res.rateLimited ? 'warn' : 'info');
+          if (res.link) {
+              reportFoundLink(state.fleetDroneId, res.link, 'http'); // share to the fleet (others benefit even while we settle)
+              if (!sessionSettled) {
+                  reportStatus(state.fleetDroneId, "⏳ Link ready — validating session before selection…", 'landing');
+                  setTimeout(runAutomationCycle, 200);
+                  return;
+              }
+              rateLimitStreak = 0;
+              reportStatus(state.fleetDroneId, "🟢 Selection link (HTTP) — navigating…", 'landing');
+              droneLog(state.fleetDroneId, "🎯 [HTTP] This drone fetched the link first — sharing + navigating", 'success');
+              window.location.href = res.link;
+              return;
+          }
+
+          // 5) RATE LIMIT (429/503) — back off; rotate IP after repeated hits.
+          if (res.rateLimited) {
+              rateLimitStreak++;
+              const ROTATE_AFTER = 3;
+              if (rateLimitStreak >= ROTATE_AFTER) {
+                  reportStatus(state.fleetDroneId, "📡 Rate-limited — rotating IP...", 'landing');
+                  droneLog(state.fleetDroneId, `🔁 Rate-limited ${rateLimitStreak}× (HTTP ${res.status}) — rotating IP`, 'warn');
+                  try {
+                      await fetch(`${API_URL}/proxy-failed/${state.fleetDroneId}`, {
+                          method: 'POST', headers: {'Content-Type': 'application/json'},
+                          body: JSON.stringify({ reason: `rate-limited HTTP ${res.status}` })
+                      });
+                  } catch (e) {}
+                  rateLimitStreak = 0;
+                  return; // server burns proxy + respawns this drone
+              }
+              const backoffMs = Math.min(60000, 8000 * Math.pow(2, rateLimitStreak - 1)) + Math.floor(Math.random() * 3000);
+              const backoffSec = Math.round(backoffMs / 1000);
+              reportStatus(state.fleetDroneId, `⚠️ Rate-limited — retry in ${backoffSec}s`, 'landing');
+              droneLog(state.fleetDroneId, `⚠️ Rate-limited (HTTP ${res.status}) — backing off ${backoffSec}s (${rateLimitStreak}/${ROTATE_AFTER})`, 'warn');
+              setTimeout(runAutomationCycle, backoffMs);
+              return;
+          }
+
+          // 6) NOT OPEN YET — re-poll every 3–6s (no reload; tab stays warm).
+          rateLimitStreak = 0;
+          const waitMs = 3000 + Math.floor(Math.random() * 3000);
+          reportStatus(state.fleetDroneId, `🕒 No slot yet — re-checking in ${Math.round(waitMs / 1000)}s (HTTP + shared)`, 'landing');
+          setTimeout(runAutomationCycle, waitMs);
           return;
+      }
+
+      // Tag the window title with "Drone N" so the window daemon can locate this
+      // exact window to Focus (bring to front + minimize others) and auto-spotlight.
+      // Re-asserted each cycle because the site keeps overwriting document.title.
+      if (window.self === window.top) {
+          const tag = 'Drone ' + state.fleetDroneId;
+          if (document.title.indexOf(tag) !== 0) {
+              document.title = tag + ' — ' + (document.title || 'Goethe');
+          }
+      }
+
+      // Act as soon as the DOM is parsed ('interactive') — do NOT wait for the full
+      // 'load' event ('complete'). On a VPN, one slow/hanging sub-resource (tracker,
+      // font, image) can delay 'load' by its ~30s timeout, which would stall the
+      // drone on the page even though all the elements it needs are already present.
+      // The state handlers below poll for their own elements, so acting at
+      // 'interactive' is safe and removes that 30s navigation stall.
+      if (document.readyState === 'loading') {
+          setTimeout(runAutomationCycle, 100);
+          return;
+      }
+
+      // INSTRUMENTATION: log (once per page load) how long this page took to become
+      // actionable + its readyState, so the navigation timing is visible on the dashboard.
+      if (!navLogged) {
+          navLogged = true;
+          droneLog(state.fleetDroneId, `⏱️ [nav] '${detectPage()}' actionable in ${Math.round(performance.now())}ms (readyState=${document.readyState})`, 'info');
       }
 
       // COOKIE BANNER: always try to dismiss the privacy/consent popup first.
@@ -223,12 +508,32 @@ async function runAutomationCycle() {
           const msUntilGo = go.startAt ? (go.startAt - Date.now()) : Infinity;
           if (performance.now() >= WARMUP_REFRESH_MS && msUntilGo > 20000) {
               reportStatus(state.fleetDroneId, "🔄 Warm-up refresh — keeping session fresh…", detectPage());
-              window.location.reload();
+              refreshExamPage(state);
               return;
           }
           reportStatus(state.fleetDroneId, `🕒 Warmed up — holding for automation start (${go.startLabel || 'scheduled'})`, detectPage());
           setTimeout(runAutomationCycle, 1000);
           return;
+      }
+
+      // ---------------------------------------------------------
+      // PAUSE GATE (top frame): hold this drone if it was manually stopped from
+      // the dashboard, or auto-pause it the moment it reaches the configured
+      // page (config.pauseAtPage). It then waits for Continue. Payment is also
+      // guarded again right before the Pay click below (iframe-safe).
+      // ---------------------------------------------------------
+      if (window.self === window.top) {
+          const ctrl = await getDroneControl(state.fleetDroneId);
+          const pg = detectPage();
+          if (ctrl.pauseAtPage && pg === ctrl.pauseAtPage && ctrl.resumedPage !== pg && !ctrl.paused) {
+              await requestPause(state.fleetDroneId, pg, false);
+              ctrl.paused = true;
+          }
+          if (ctrl.paused) {
+              reportStatus(state.fleetDroneId, "⏸ Paused — press Continue on the dashboard", pg);
+              setTimeout(runAutomationCycle, 1200);
+              return;
+          }
       }
 
       // ---------------------------------------------------------
@@ -290,8 +595,18 @@ async function runAutomationCycle() {
               return;
           }
 
+          // PAUSE GATE (payment): if this drone was stopped, or "pause at payment"
+          // is set, HOLD here before clicking Pay until Continue is pressed.
+          const payCtrl = await getDroneControl(state.fleetDroneId);
+          if (payCtrl.paused || (payCtrl.pauseAtPage === 'payment' && payCtrl.resumedPage !== 'payment')) {
+              if (!payCtrl.paused) await requestPause(state.fleetDroneId, 'payment', false);
+              reportStatus(state.fleetDroneId, "⏸ Paused before Pay — press Continue on the dashboard", 'payment');
+              setTimeout(runAutomationCycle, 1500);
+              return;
+          }
+
           if (state.iframe_filled && !state.pay_clicked && !window.isClickingPay) {
-              window.isClickingPay = true; 
+              window.isClickingPay = true;
               console.log("✅ [Cashier Iframe] Bridge confirmed. Initiating final click sequence...");
               
               await chrome.storage.local.set({ pay_clicked: true });
@@ -345,20 +660,24 @@ async function runAutomationCycle() {
           window.location.href = state.exam_base_url || "/";
           return;
       }
-
-      if (state.wicket_timeout && Date.now() < state.wicket_timeout) {
-          const remainingSleep = state.wicket_timeout - Date.now();
-          console.log(`⏳ [State: Penalty] Waiting ${Math.round(remainingSleep/1000)} seconds to evade ban...`);
-          reportStatus(state.fleetDroneId, `⏳ Waiting ${Math.round(remainingSleep/1000)}s...`);
-          await sleep(remainingSleep);
-          await chrome.storage.local.remove("wicket_timeout");
-      }
+      // (Queue cooldown is enforced by the EXAM-ID FAST PATH at the top of the
+      // cycle, which holds on the exam page until wicket_timeout expires before
+      // re-attempting — so there's no standalone penalty-sleep here anymore.)
 
       // --- STATE: ACTUAL RATE LIMIT / BLOCK (BURN & ROTATE IP) ---
       // Compute page text only here (it's an expensive reflow, so we avoid
       // doing it every cycle). Detects 429 rate-limits AND 403 Forbidden.
       const pageText = (document.body.innerText || '').toLowerCase();
-      const isHardBlocked = pageText.includes("too many requests") ||
+
+      // PERMANENT IP BAN — Goethe blocks the exit IP itself ("Your IP address …
+      // has been blocked due to misuse."). Reloading is POINTLESS (the IP is dead);
+      // we must burn this proxy and rotate to a fresh IP immediately, with NO retry.
+      const isBannedIp = pageText.includes("blocked due to misuse") ||
+                         pageText.includes("has been blocked") ||
+                         (pageText.includes("your ip address") && pageText.includes("blocked"));
+
+      const isHardBlocked = isBannedIp ||
+                            pageText.includes("too many requests") ||
                             pageText.includes("permanently blocked") ||
                             pageText.includes("access denied") ||
                             pageText.includes("http status 429") ||
@@ -369,10 +688,38 @@ async function runAutomationCycle() {
                             (pageText.includes("forbidden") && pageText.length < 400); // short "Forbidden" error page
 
       if (isHardBlocked && !currentUrl.includes('wicket')) {
-          reportStatus(state.fleetDroneId, "🔥 Blocked (403/429). Burning IP & rotating...", 'wicket');
+          // TRANSIENT /coe 403 (NOT a ban): Akamai's FIRST hit on the selection page
+          // often returns "Forbidden", then succeeds on a retry within the SAME IP/
+          // session — like clicking "Select modules", getting Forbidden, and it
+          // working on the 2nd click. So on /coe we RELOAD a few times first.
+          // A banned-IP page skips this entirely (reloading can't fix a dead IP).
+          if (!isBannedIp && currentUrl.includes('/coe')) {
+              const tries = (state.coe_forbidden_tries || 0) + 1;
+              const MAX_COE_RETRIES = 4;
+              if (tries <= MAX_COE_RETRIES) {
+                  await chrome.storage.local.set({ coe_forbidden_tries: tries });
+                  reportStatus(state.fleetDroneId, `🔁 Selection 403 — retrying (${tries}/${MAX_COE_RETRIES})…`, 'selection');
+                  droneLog(state.fleetDroneId, `🔁 /coe transient 403 — retry ${tries}/${MAX_COE_RETRIES} (same IP, like a 2nd click)`, 'warn');
+                  await sleep(600 + Math.floor(Math.random() * 1200)); // brief human-like pause
+                  window.location.reload(); // re-hit the SAME /coe link
+                  return;
+              }
+              await chrome.storage.local.remove('coe_forbidden_tries'); // exhausted → real block
+          }
+          await chrome.storage.local.remove('coe_forbidden_tries');
+          // Parse the banned IP from the page so the server can record it.
+          let bannedIp = null;
+          if (isBannedIp) {
+              const m = (document.body.innerText || '').match(/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/);
+              bannedIp = m ? m[0] : null;
+              reportStatus(state.fleetDroneId, "🚫 IP banned by Goethe — saving to ban list & rotating...", 'wicket');
+              droneLog(state.fleetDroneId, `🚫 IP permanently banned${bannedIp ? ` (${bannedIp})` : ''} — added to persistent ban list, rotating (no retry)`, 'error');
+          } else {
+              reportStatus(state.fleetDroneId, "🔥 Rate-limited (429) — burning for this run & rotating...", 'wicket');
+          }
           await fetch(`${API_URL}/report-429`, {
               method: 'POST', headers: {'Content-Type': 'application/json'},
-              body: JSON.stringify({ droneId: state.fleetDroneId })
+              body: JSON.stringify({ droneId: state.fleetDroneId, banned: isBannedIp, bannedIp })
           });
           return;
       }
@@ -409,28 +756,9 @@ async function runAutomationCycle() {
           return; // server burns the proxy and respawns this drone on a new one
       }
 
-      // --- STATE: EXAM ID (Landing Page) - UNTOUCHED ---
-      if (currentUrl.includes('examid') || document.querySelector("a[onclick='gotoExamDetail()']")) {
-          reportStatus(state.fleetDroneId, "🟢 Landing Page: Pushing to options...", 'landing');
-
-          const firstBtn = document.querySelector("a[onclick='gotoExamDetail()']");
-          if (firstBtn) {
-              // Human-like interaction: scroll into view + natural delay before
-              // clicking (keeps the bot looking organic to the site).
-              console.log("👉 [State: Landing Page] Button found! Clicking (human sim)...");
-              await humanClick(firstBtn);
-              setTimeout(runAutomationCycle, 2000);
-          } else {
-              // No slot open yet. Wait a randomised 20-30s before refreshing so
-              // we don't hammer the server (which triggers rate-limits / 429s).
-              const waitMs = 20000 + Math.floor(Math.random() * 10000);
-              const waitSec = Math.round(waitMs / 1000);
-              reportStatus(state.fleetDroneId, `🕒 No slot yet — refreshing in ${waitSec}s`, 'landing');
-              await sleep(waitMs);
-              window.location.reload();
-          }
-          return;
-      }
+      // (The examId LANDING page is fully handled by the EXAM-ID FAST PATH at the
+      // top of this cycle — server-link + own-fetch race, no button, no reload.
+      // Execution only reaches here on the booking-flow pages below.)
 
       // --- STATE: OPTIONS (MODULE CHECKBOXES) ---
       if (currentUrl.includes('options')) {
@@ -471,8 +799,12 @@ async function runAutomationCycle() {
                       window.loginFailReported = false;
                       chrome.storage.local.set({ fleetUser: data.user, fleetCC: data.creditCard, login_attempted: false });
                   } else if (data.reason === 'no_match') {
-                      reportStatus(state.fleetDroneId, "🚫 No queued user matches available modules. Stopping drone.", 'options');
+                      // Don't kill the drone — keep the browser open, notify the
+                      // dashboard, and keep re-checking so it picks up a user if one
+                      // is added/freed that matches these modules.
+                      reportStatus(state.fleetDroneId, "⚠️ No valid user for these modules — holding (will retry)", 'options');
                       await fetch(`${API_URL}/no-match/${state.fleetDroneId}`, { method: 'POST' });
+                      setTimeout(runAutomationCycle, 8000);
                       return;
                   } else {
                       reportStatus(state.fleetDroneId, "💤 Holding: Queue empty.", 'options');

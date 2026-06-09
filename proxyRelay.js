@@ -12,6 +12,8 @@
 // Node.js. This works uniformly for HTTP and SOCKS5, with or without auth.
 // ==========================================
 
+const http = require('http');
+
 let ProxyChain = null;
 try {
     ProxyChain = require('proxy-chain');
@@ -79,8 +81,32 @@ async function stopAllRelays() {
     }
 }
 
+// Health-check a relay's UPSTREAM tunnel by fetching a tiny endpoint THROUGH it.
+// Success proves the SOCKS server actually forwards traffic; failure means the
+// tunnel is dead (server down / unreachable / NordVPN connection limit hit) — so
+// the caller can skip that server instead of launching a drone onto a broken
+// proxy (the ERR_TUNNEL_CONNECTION_FAILED / "Upstream Error" symptom). Uses a
+// neutral generate_204 (NOT goethe), so it only tests connectivity, not the site.
+function testRelay(port, timeoutMs = 6000) {
+    return new Promise(resolve => {
+        let settled = false;
+        const done = (ok) => { if (settled) return; settled = true; try { req.destroy(); } catch (e) {} resolve(ok); };
+        const req = http.request({
+            host: '127.0.0.1',
+            port,
+            method: 'GET',
+            // Absolute URI → the relay proxies this request to its upstream.
+            path: 'http://www.gstatic.com/generate_204',
+            headers: { Host: 'www.gstatic.com', 'Connection': 'close' }
+        }, (res) => { res.resume(); done(res.statusCode > 0 && res.statusCode < 500); });
+        req.setTimeout(timeoutMs, () => done(false));
+        req.on('error', () => done(false));
+        req.end();
+    });
+}
+
 function isAvailable() {
     return ProxyChain !== null;
 }
 
-module.exports = { startRelay, stopRelay, stopAllRelays, isAvailable };
+module.exports = { startRelay, stopRelay, stopAllRelays, isAvailable, testRelay };

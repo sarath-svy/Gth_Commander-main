@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs-extra');
 const path = require('path');
+const net = require('net');
 const { spawn, exec } = require('child_process');
 const proxyRelay = require('./proxyRelay');
 
@@ -24,21 +25,50 @@ let fleetState = {
     config: {},
     users: [],
     activeDrones: {},
-    proxyPool: [],         // Available proxies
+    proxyPool: [],         // Available proxies (each tagged with .provider)
     burnedProxies: [],     // Rate-limited proxies
-    proxyMode: 'none',     // 'none' | 'custom' | 'nordvpn'
-    automationStartAt: null // ms timestamp: drones warm up but DON'T click/book until this time (null = act immediately)
+    proxyMode: 'none',     // legacy single-mode flag ('none'|'custom'|'nordvpn'|'mixed')
+    droneNetwork: {},      // per-drone network type: { [droneId]: 'direct'|'nordvpn'|'custom'|… }
+    droneCount: 0,         // number of drones actually launched this run (mix sum or maxBrowsers)
+    automationStartAt: null, // ms timestamp: drones warm up but DON'T click/book until this time (null = act immediately)
+    examLink: ""           // booking link, once the server's direct-IP hunter (or a drone) finds it
 };
 
 const SEED_PROFILE_PATH = path.resolve(__dirname, 'SeedProfile');
 const EXTENSION_PATH = path.resolve(__dirname, 'Extension');
 const CONFIG_FILE = path.resolve(__dirname, 'fleet-config.json');
 const HISTORY_FILE = path.resolve(__dirname, 'booking-history.csv');
+const BANNED_FILE = path.resolve(__dirname, 'banned-ips.json'); // PERSISTENT IP ban list
+
+// ==========================================
+// PERSISTENT IP BAN LIST (survives restarts, cleared only by the user)
+// Goethe "blocked due to misuse" bans the exit IP for good — we record the proxy
+// (by id = host:port) so it's NEVER handed out again, in this run or any future
+// run, until the user removes it. Rate-limits (429) are NOT stored here — those
+// are temporary and only burned for the current run.
+// ==========================================
+function loadBannedList() {
+    try { if (fs.existsSync(BANNED_FILE)) return JSON.parse(fs.readFileSync(BANNED_FILE, 'utf8')); } catch (e) {}
+    return [];
+}
+function saveBannedList(list) {
+    try { fs.writeFileSync(BANNED_FILE, JSON.stringify(list, null, 2)); } catch (e) { console.error('Ban-list save failed:', e.message); }
+}
+function addPermanentBan(id, info) {
+    if (!id) return;
+    const list = loadBannedList();
+    if (!list.some(b => b.id === id)) {
+        list.push({ id, host: (info && info.host) || id, country: (info && info.country) || '', ip: (info && info.ip) || '', bannedAt: new Date().toISOString() });
+        saveBannedList(list);
+    }
+}
 
 // runtime feature settings (mirrored from config)
 let autoRetryFailed = false;     // retry users that fail login (transient errors)
 let scheduledTimer = null;       // pending scheduled-start timer
 let heartbeatTimer = null;       // interval that checks for stuck drones
+let examLinkPollerTimer = null;  // server-side direct-IP booking-link hunter
+let examLinkRateBackoff = 0;     // backoff steps if the server IP gets rate-limited
 
 // ==========================================
 // CONFIG PERSISTENCE (survives restarts, shared across browsers)
@@ -153,6 +183,112 @@ function sysLog(message, type = 'info') {
     const timestamp = new Date().toLocaleTimeString();
     console.log(`[${timestamp}] [${type.toUpperCase()}] ${message}`);
     pushToDashboard('log', { message, type });
+}
+
+// ==========================================
+// SERVER-SIDE BOOKING-LINK HUNTER (direct IP)
+// ==========================================
+// Pull the server-rendered examButtonLink out of the exam page HTML.
+function parseExamButtonLink(text) {
+    if (!text) return "";
+    const m = text.match(/examButtonLink['"]?\]?\s*=\s*["']([^"']*)["']/);
+    return m ? m[1].trim() : "";
+}
+
+// Strip the params we inject (fleetDroneId, fleetSession, _cb) so the configured
+// target URL never carries drone/session ids into the poller or a relaunch. Robust
+// regardless of separator/order (defends against a previously-polluted saved URL).
+function cleanExamUrl(raw) {
+    if (!raw) return raw;
+    try {
+        const u = new URL(raw);
+        ['fleetDroneId', 'fleetSession', '_cb'].forEach(p => u.searchParams.delete(p));
+        return u.toString();
+    } catch (e) {
+        return String(raw).split(/[?&]fleetDroneId/)[0];
+    }
+}
+
+// Poll the exam page from the server's DIRECT IP (no VPN/SOCKS) — faster and
+// lower-latency than the drones' NordVPN proxies. The instant the booking link
+// appears we store it in fleetState.examLink; every drone then picks it up from
+// GET /api/exam-link and navigates. Self-stops once found or the fleet stops.
+// If the server IP gets rate-limited it just backs off — the drones keep their
+// own polling as a fallback, so the run is never blocked.
+function startExamLinkPoller() {
+    stopExamLinkPoller();
+    examLinkRateBackoff = 0;
+    const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36';
+    const BURST_CALLS = 5;   // first 5 polls run at 1s, then ease to 2–3s
+    let pollCount = 0;       // counts actual network polls (not holding ticks)
+    let easedLogged = false;
+    const tick = async () => {
+        if (!fleetState.isRunning) return;     // fleet stopped
+        if (fleetState.examLink) return;       // already have it (server or a drone)
+        const url = cleanExamUrl(fleetState.config && fleetState.config.targetUrl);
+        if (!url) { examLinkPollerTimer = setTimeout(tick, 1000); return; }
+        // Hold until automation go-live (booking-open time) to avoid early hammering.
+        if (fleetState.automationStartAt && Date.now() < fleetState.automationStartAt) {
+            examLinkPollerTimer = setTimeout(tick, 1000);
+            return;
+        }
+        pollCount++; // this is a real network poll
+        const sep = url.includes('?') ? '&' : '?';
+        const bust = `${url}${sep}_cb=${Date.now()}`;
+        // Cadence: 1s for the first 5 calls, then ease to 2–3s. Rate-limit backoff overrides.
+        let nextMs = pollCount < BURST_CALLS ? 1000 : (2000 + Math.floor(Math.random() * 1000));
+        if (pollCount >= BURST_CALLS && !easedLogged) {
+            easedLogged = true;
+            sysLog("🛰️ Server link-hunter easing to 2–3s interval (first 5 calls done).", 'info');
+        }
+        const t0 = Date.now();
+        let logMsg, logType = 'info';
+        try {
+            const r = await fetch(bust, { headers: {
+                'User-Agent': UA,
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Cache-Control': 'no-cache, no-store, max-age=0',
+                'Pragma': 'no-cache'
+            }});
+            const ms = Date.now() - t0;
+            if (r.status === 429 || r.status === 503) {
+                examLinkRateBackoff = Math.min(examLinkRateBackoff + 1, 6);
+                nextMs = Math.min(30000, 2000 * Math.pow(2, examLinkRateBackoff - 1));
+                logMsg = `🛰️ [Server poll #${pollCount}] direct IP → HTTP ${r.status} RATE-LIMITED (${ms}ms) — backing off ${Math.round(nextMs / 1000)}s (drones unaffected)`;
+                logType = 'warn';
+            } else if (r.ok) {
+                examLinkRateBackoff = 0;
+                const link = parseExamButtonLink(await r.text());
+                if (link) {
+                    fleetState.examLink = link;
+                    sysLog(`🎯 SERVER (direct IP) GOT THE BOOKING LINK on poll #${pollCount} (${ms}ms) — pushing to all drones: ${link}`, 'success');
+                    pushToDashboard('examLinkFound', { link, source: 'server' });
+                    return; // self-stop: drones now pull it from /api/exam-link
+                }
+                logMsg = `🛰️ [Server poll #${pollCount}] direct IP → HTTP 200 (${ms}ms) — not open yet, next in ${Math.round(nextMs / 1000)}s`;
+            } else {
+                logMsg = `🛰️ [Server poll #${pollCount}] direct IP → HTTP ${r.status} (${ms}ms)`;
+                logType = 'warn';
+            }
+        } catch (e) {
+            logMsg = `🛰️ [Server poll #${pollCount}] direct IP → network error: ${e.message}`;
+            logType = 'warn';
+        }
+        sysLog(logMsg, logType); // one log line PER server call, as requested
+        examLinkPollerTimer = setTimeout(tick, nextMs);
+    };
+    sysLog("🛰️ Server link-hunter started (direct IP, 1s for first 5 calls → 2–3s) — racing the drones for the booking link.", 'info');
+    // One-time: show which public IP the server is hunting from (your direct, no-VPN IP).
+    (async () => {
+        try {
+            const ipr = await fetch('https://api.ipify.org', { signal: AbortSignal.timeout(5000) });
+            if (ipr.ok) sysLog(`🛰️ Server link-hunter direct IP: ${(await ipr.text()).trim()}`, 'info');
+        } catch (e) {}
+    })();
+    examLinkPollerTimer = setTimeout(tick, 0);
+}
+function stopExamLinkPoller() {
+    if (examLinkPollerTimer) { clearTimeout(examLinkPollerTimer); examLinkPollerTimer = null; }
 }
 
 // ==========================================
@@ -296,31 +432,146 @@ function generateNordVPNProxies(username, password, countries) {
     return proxies;
 }
 
-function getNextProxy(droneId) {
-    if (fleetState.proxyMode === 'none' || fleetState.proxyPool.length === 0) {
-        return null;
-    }
+// TCP-connect latency to one server (no SOCKS handshake needed). The RTT from
+// here to the SOCKS server is the dominant per-request overhead, so lower = a
+// faster site load. Returns ms, or Infinity if unreachable/timed out.
+function probeLatency(host, port, timeoutMs = 4000) {
+    return new Promise(resolve => {
+        const t0 = Date.now();
+        const sock = new net.Socket();
+        let done = false;
+        const finish = (ms) => { if (done) return; done = true; try { sock.destroy(); } catch (e) {} resolve(ms); };
+        sock.setTimeout(timeoutMs);
+        sock.once('connect', () => finish(Date.now() - t0));
+        sock.once('timeout', () => finish(Infinity));
+        sock.once('error', () => finish(Infinity));
+        try { sock.connect(parseInt(port), host); } catch (e) { finish(Infinity); }
+    });
+}
 
-    // Find an unburned proxy not currently in use by another drone
+// Measure every proxy in the pool (parallel), sort fastest-first, and mark
+// unreachable servers burned so getNextProxy skips them. Run at ignite so each
+// drone is handed the fastest non-burned server of its provider.
+async function rankProxyPoolByLatency() {
+    const pool = fleetState.proxyPool;
+    if (!pool.length) return;
+    sysLog(`📶 Probing ${pool.length} proxy server(s) to pick the fastest…`, 'info');
+    await Promise.all(pool.map(async p => {
+        p.latency = await probeLatency(p.host, p.port);
+        if (p.latency === Infinity) p.burned = true; // unreachable now → skip (still usable on later exhaustion reset)
+    }));
+    // Ascending latency → getNextProxy (which takes the first available) hands out
+    // the fastest server of each provider first.
+    pool.sort((a, b) => (a.latency ?? Infinity) - (b.latency ?? Infinity));
+    fleetState.burnedProxies = pool.filter(p => p.burned).map(p => p.id);
+    const reachable = pool.filter(p => p.latency !== Infinity);
+    const fastest = reachable.slice(0, 3).map(p => `${p.host} ${Math.round(p.latency)}ms`).join(', ');
+    sysLog(`📶 ${reachable.length}/${pool.length} servers reachable. Fastest: ${fastest || '(none!)'}`, reachable.length ? 'success' : 'error');
+    broadcastProxyStats();
+}
+
+// Per-drone network assignment. A drone keeps its assigned network TYPE for its
+// whole life (rotation picks another proxy of the SAME provider, never crosses
+// networks). 'direct' drones use the ISP connection (no proxy).
+function getNextProxy(droneId) {
+    const networkType = fleetState.droneNetwork[droneId] || legacyNetworkType();
+    if (networkType === 'direct') return null;
+
+    // Pool restricted to THIS drone's provider — isolates one network from another.
+    const providerPool = fleetState.proxyPool.filter(p => p.provider === networkType);
+    if (providerPool.length === 0) return null;
+
+    // Find an unburned proxy of this provider not currently used by another drone.
     const inUseProxies = new Set();
     for (const [id, drone] of Object.entries(fleetState.activeDrones)) {
-        if (id !== String(droneId) && drone.proxy) {
-            inUseProxies.add(drone.proxy.id);
-        }
+        if (id !== String(droneId) && drone.proxy) inUseProxies.add(drone.proxy.id);
     }
 
-    const available = fleetState.proxyPool.filter(p => !p.burned && !inUseProxies.has(p.id));
-
+    const byLatency = (a, b) => (a.latency ?? Infinity) - (b.latency ?? Infinity);
+    const available = providerPool.filter(p => !p.burned && !inUseProxies.has(p.id)).sort(byLatency);
     if (available.length === 0) {
-        // All proxies burned or in use — reset burned status and try again
-        sysLog("⚠️ All proxies exhausted! Resetting burned proxies...", "warn");
-        fleetState.proxyPool.forEach(p => p.burned = false);
-        fleetState.burnedProxies = [];
-        const retryAvailable = fleetState.proxyPool.filter(p => !inUseProxies.has(p.id));
-        return retryAvailable.length > 0 ? retryAvailable[0] : null;
+        // This provider's proxies are all burned/in-use — reset THIS provider's
+        // burned flags (leave other providers untouched) and retry with the fastest.
+        // EXCEPTION: never un-burn a permanently-banned IP (Goethe blocked it for
+        // the whole run) or an unreachable one (latency === Infinity).
+        sysLog(`⚠️ ${networkType} proxies exhausted! Resetting burned ${networkType} proxies...`, "warn");
+        providerPool.forEach(p => { if (!p.permanentlyBanned && p.latency !== Infinity) p.burned = false; });
+        fleetState.burnedProxies = fleetState.proxyPool.filter(p => p.burned).map(p => p.id);
+        const retry = providerPool.filter(p => !p.burned && !inUseProxies.has(p.id)).sort(byLatency);
+        return retry.length > 0 ? retry[0] : null;
+    }
+    return available[0]; // fastest unburned, not-in-use server of this provider
+}
+
+// Legacy fallback: when no per-drone plan exists, derive the type from proxyMode.
+function legacyNetworkType() {
+    if (fleetState.proxyMode === 'custom') return 'custom';
+    if (fleetState.proxyMode === 'nordvpn') return 'nordvpn';
+    return 'direct';
+}
+
+// Human-readable network label for a drone (logs + dashboard).
+function networkLabel(droneId) {
+    const t = fleetState.droneNetwork[droneId] || legacyNetworkType();
+    if (t === 'direct') return 'Direct ISP';
+    if (t === 'nordvpn') return 'NordVPN';
+    if (t === 'custom') return 'Custom proxy';
+    return t;
+}
+
+// Build the per-drone network plan + tagged proxy pool from body.networks
+// (array of { type, count, nordvpn?, proxyList? }). Falls back to the legacy
+// single-mode (proxyMode + maxBrowsers) when body.networks is absent.
+// Returns the total number of drones to launch.
+function buildNetworkPlan(body) {
+    fleetState.proxyPool = [];
+    fleetState.droneNetwork = {};
+    fleetState.burnedProxies = [];
+
+    let sources = Array.isArray(body.networks) ? body.networks.filter(s => s && s.type && (parseInt(s.count) || 0) > 0) : null;
+
+    // Legacy fallback: one source from proxyMode spanning maxBrowsers drones.
+    if (!sources || sources.length === 0) {
+        const max = parseInt(body.config && body.config.maxBrowsers) || 1;
+        const mode = body.proxyMode || 'none';
+        sources = [{
+            type: mode === 'none' ? 'direct' : mode,
+            count: max,
+            nordvpn: body.nordvpn,
+            proxyList: body.proxyList
+        }];
     }
 
-    return available[0];
+    let droneId = 1;
+    const summary = [];
+    for (const src of sources) {
+        const count = parseInt(src.count) || 0;
+        for (let k = 0; k < count; k++) { fleetState.droneNetwork[droneId] = src.type; droneId++; }
+
+        if (src.type === 'nordvpn' && src.nordvpn) {
+            const ps = generateNordVPNProxies(src.nordvpn.username, src.nordvpn.password, src.nordvpn.countries || ['nl', 'se', 'us'])
+                .map(p => ({ ...p, provider: 'nordvpn' }));
+            fleetState.proxyPool.push(...ps);
+        } else if (src.type === 'custom' && src.proxyList) {
+            const ps = parseProxyList(src.proxyList).map(p => ({ ...p, provider: 'custom' }));
+            fleetState.proxyPool.push(...ps);
+        }
+        summary.push(`${count}× ${src.type}`);
+    }
+
+    // Apply the PERSISTENT ban list — exclude IPs Goethe permanently blocked in a
+    // previous run (stays excluded until the user clears them from the dashboard).
+    const banned = new Set(loadBannedList().map(b => b.id));
+    let bannedHit = 0;
+    fleetState.proxyPool.forEach(p => {
+        if (banned.has(p.id)) { p.burned = true; p.permanentlyBanned = true; bannedHit++; }
+    });
+    fleetState.burnedProxies = fleetState.proxyPool.filter(p => p.burned).map(p => p.id);
+
+    const total = droneId - 1;
+    fleetState.proxyMode = sources.length > 1 ? 'mixed' : (sources[0] ? (sources[0].type === 'direct' ? 'none' : sources[0].type) : 'none');
+    sysLog(`🧭 Network plan: ${summary.join('  ·  ')}  →  ${total} drone(s), ${fleetState.proxyPool.length} proxies in pool${bannedHit ? ` (${bannedHit} excluded by persistent ban list)` : ''}`, 'info');
+    return total;
 }
 
 function burnProxy(proxy) {
@@ -335,7 +586,7 @@ function burnProxy(proxy) {
 }
 
 function broadcastProxyStats() {
-    if (fleetState.proxyMode === 'none') return;
+    if (fleetState.proxyPool.length === 0) return; // nothing to report when all-direct
     pushToDashboard('proxyStats', {
         proxyStats: {
             total: fleetState.proxyPool.length,
@@ -352,12 +603,14 @@ function buildProxyArg(proxy) {
     if (!proxy) return [];
     // Chrome accepts: --proxy-server="socks5://host:port" or --proxy-server="http://host:port"
     const proxyUrl = `${proxy.protocol}://${proxy.host}:${proxy.port}`;
-    // Keep loopback direct here too (the relay path already does this). Without
-    // it, a fallback to this path would tunnel the drone's localhost API calls
-    // through the proxy and stall the options page.
+    // Bypass the proxy for loopback so the drone's localhost API calls go DIRECT
+    // (instant), while goethe traffic still goes through the proxy. NOTE: we must
+    // NOT use the "<-loopback>" token — that SUBTRACTS the implicit loopback
+    // bypass (i.e. forces localhost THROUGH the proxy), which is what caused the
+    // 5–7s stall on the options page. Listing the loopback hosts bypasses them.
     return [
         `--proxy-server="${proxyUrl}"`,
-        `--proxy-bypass-list="<-loopback>;localhost;127.0.0.1"`
+        `--proxy-bypass-list="localhost;127.0.0.1"`
     ];
 }
 
@@ -576,39 +829,66 @@ async function launchDrone(droneId) {
         // and so the locale matches. Written into the Default profile's Preferences.
         seedProfilePreferences(tempProfilePath, droneId, sessionId);
 
-        // Get proxy for this drone and start a local relay.
+        // Get a WORKING proxy for this drone and start a local relay.
         // Chrome cannot authenticate SOCKS5 (NordVPN) or pass proxy passwords
         // via --proxy-server, so we route through a local password-free relay
         // that forwards to the real upstream proxy (auth handled in Node).
-        const proxy = getNextProxy(droneId);
+        const networkType = fleetState.droneNetwork[droneId] || legacyNetworkType();
+        let proxy = null;
         let proxyArgs = [];
-        if (proxy) {
-            try {
-                const relayPort = await proxyRelay.startRelay(droneId, proxy, (msg) => {
-                    sysLog(`⚠️ Drone ${droneId} proxy error: ${msg}`, 'warn');
-                });
-                if (relayPort) {
+        if (networkType !== 'direct' && !proxyRelay.isAvailable()) {
+            // No relay library — fall back to a plain --proxy-server (no SOCKS auth,
+            // no health-check). Keeps the original behaviour for that environment.
+            const cand = getNextProxy(droneId);
+            if (cand) { proxy = cand; proxyArgs = buildProxyArg(cand); }
+        } else if (networkType !== 'direct') {
+            // VALIDATE the tunnel before committing: pick a server → start relay →
+            // health-check it. If the upstream tunnel is dead (server down, or
+            // NordVPN's concurrent-connection limit hit during a rotation storm),
+            // burn it and try the next fastest. This stops a drone from launching
+            // onto a broken proxy (the ERR_TUNNEL_CONNECTION_FAILED / Upstream Error).
+            const MAX_ATTEMPTS = 4;
+            for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+                const cand = getNextProxy(droneId);
+                if (!cand) break; // none available right now
+                let relayPort = null;
+                try {
+                    relayPort = await proxyRelay.startRelay(droneId, cand, (msg) => {
+                        sysLog(`⚠️ Drone ${droneId} proxy error: ${msg}`, 'warn');
+                    });
+                } catch (e) { relayPort = null; }
+
+                const ok = relayPort ? await proxyRelay.testRelay(relayPort) : false;
+                if (ok) {
+                    proxy = cand;
                     proxyArgs = [
                         `--proxy-server="http://127.0.0.1:${relayPort}"`,
-                        // <-loopback> guarantees ALL loopback addresses (localhost,
-                        // 127.0.0.1, ::1) bypass the proxy. Without it the drone's
-                        // fetch to our localhost server gets tunneled through the
-                        // proxy and stalls — which is the delay seen on the options
-                        // page (the only step that awaits a server call).
-                        `--proxy-bypass-list="<-loopback>;localhost;127.0.0.1"`
+                        // Bypass loopback so localhost API calls go DIRECT (instant).
+                        `--proxy-bypass-list="localhost;127.0.0.1"`
                     ];
-                } else {
-                    proxyArgs = buildProxyArg(proxy);
+                    break;
                 }
-            } catch (e) {
-                sysLog(`WARN Drone ${droneId} relay failed: ${e.message}. Using direct proxy.`, 'warn');
-                proxyArgs = buildProxyArg(proxy);
+                // Dead tunnel → burn this server (temporary, not a permanent ban) and try the next.
+                sysLog(`⚠️ Drone ${droneId}: ${cand.host} tunnel failed health-check — skipping to next server (${attempt}/${MAX_ATTEMPTS}).`, 'warn');
+                burnProxy(cand);
+                await proxyRelay.stopRelay(droneId);
+            }
+
+            if (!proxy) {
+                // No working server right now (all dead / NordVPN connection limit).
+                // Back off and retry instead of launching a broken or direct browser
+                // (a direct launch would leak the real IP for a proxied drone).
+                sysLog(`⏳ Drone ${droneId}: no working ${networkType} server available right now — retrying in 15s (lets connections free up).`, 'error');
+                pushToDashboard('droneUpdate', { droneId, status: '⏳ No working proxy — retrying…', network: networkLabel(droneId), proxy: 'Rotating...', user: null });
+                if (fleetState.isRunning) setTimeout(() => { if (fleetState.isRunning && !fleetState.activeDrones[droneId]) launchDrone(droneId); }, 15000);
+                return;
             }
         }
 
-        // Build target URL with drone ID + unique session id
-        const separator = fleetState.config.targetUrl.includes('?') ? '&' : '?';
-        const targetUrlWithId = `${fleetState.config.targetUrl}${separator}fleetDroneId=${droneId}&fleetSession=${sessionId}`;
+        // Build target URL with drone ID + unique session id (from a CLEAN base).
+        const cleanTarget = cleanExamUrl(fleetState.config.targetUrl);
+        const separator = cleanTarget.includes('?') ? '&' : '?';
+        const targetUrlWithId = `${cleanTarget}${separator}fleetDroneId=${droneId}&fleetSession=${sessionId}`;
 
         const browserExe = resolveBrowserExe();
         if (!browserExe) {
@@ -696,11 +976,13 @@ async function launchDrone(droneId) {
             status: 'launched'
         };
 
-        const proxyInfo = proxy ? ` via ${proxy.protocol}://${proxy.host}:${proxy.port}` : ' (no proxy)';
-        sysLog(`🛸 Drone ${droneId} launched${proxyInfo}`, 'success');
+        const net = networkLabel(droneId);
+        const proxyInfo = proxy ? ` via ${net} — ${proxy.protocol}://${proxy.host}:${proxy.port}${proxy.country ? ` (${proxy.country})` : ''}` : ` via ${net}`;
+        sysLog(`🛸 Drone ${droneId} → ${net}${proxy ? `: ${proxy.host}:${proxy.port}${proxy.country ? ` (${proxy.country})` : ''}` : ''}`, 'success');
         pushToDashboard('droneUpdate', {
             droneId,
             status: '🟢 Launched',
+            network: net,
             proxy: proxy ? `${proxy.host}:${proxy.port}` : 'Direct',
             user: null
         });
@@ -820,10 +1102,16 @@ function stopHeartbeat() {
 async function igniteSwarm(body) {
     fleetState.isRunning = true;
     fleetState.config = body.config;
+    // Defensive: ensure the configured target URL never carries injected params
+    // (fleetDroneId/fleetSession/_cb) — keeps the poller + every drone on the
+    // correct page even if a polluted URL was saved from an earlier build.
+    if (fleetState.config) fleetState.config.targetUrl = cleanExamUrl(fleetState.config.targetUrl);
     fleetState.users = body.users.map(u => ({ ...u, status: 'Queued' }));
-    fleetState.proxyMode = body.proxyMode || 'none';
-    fleetState.burnedProxies = [];
     autoRetryFailed = !!(body.config && body.config.autoRetry);
+
+    // Build the per-drone network plan (counts per source) + tagged proxy pool.
+    // Backward compatible: falls back to legacy single proxyMode if no networks.
+    const planned = buildNetworkPlan(body);
 
     // Two-phase launch: browsers open NOW (warm up + sit on the landing page),
     // but the drones don't start clicking/booking until automationStartAt.
@@ -847,27 +1135,19 @@ async function igniteSwarm(body) {
     // prompt (v142+) from stalling the flow when the content script calls localhost.
     applyLocalNetworkAccessPolicy(fleetState.config.browserType || 'edge');
 
-    // Setup proxy pool
-    if (fleetState.proxyMode === 'custom' && body.proxyList) {
-        fleetState.proxyPool = parseProxyList(body.proxyList);
-        sysLog(`📡 Loaded ${fleetState.proxyPool.length} custom proxies`, 'info');
-    } else if (fleetState.proxyMode === 'nordvpn' && body.nordvpn) {
-        fleetState.proxyPool = generateNordVPNProxies(
-            body.nordvpn.username, body.nordvpn.password,
-            body.nordvpn.countries || ['nl', 'se', 'us']
-        );
-        sysLog(`📡 Generated ${fleetState.proxyPool.length} NordVPN SOCKS5 proxies`, 'info');
-    } else {
-        fleetState.proxyPool = [];
-        sysLog("⚠️ No proxy configured — all drones share your real IP", 'warn');
-    }
-
     sysLog("🔥 SWARM IGNITION ACTIVATED", "warn");
     preventSleep(); // keep the PC awake for the whole run
     broadcastProxyStats();
     startHeartbeat();
+    fleetState.examLink = "";   // clear any stale link from a previous run
+    startExamLinkPoller();      // server's fast direct-IP hunt for the booking link
 
-    const maxBrowsers = parseInt(fleetState.config.maxBrowsers) || 2;
+    // Rank proxy servers fastest-first (and drop unreachable) BEFORE launching, so
+    // every drone is handed the fastest non-burned server of its provider.
+    await rankProxyPoolByLatency();
+
+    const maxBrowsers = planned > 0 ? planned : (parseInt(fleetState.config.maxBrowsers) || 2);
+    fleetState.droneCount = maxBrowsers; // single source of truth for how many drones exist
     for (let i = 1; i <= maxBrowsers; i++) {
         await launchDrone(i);
         await new Promise(resolve => setTimeout(resolve, 2000));
@@ -880,6 +1160,27 @@ app.post('/api/start', async (req, res) => {
     if (fleetState.isRunning) return res.status(400).json({ error: "Fleet already running" });
     const result = await igniteSwarm(req.body);
     res.json({ status: "success", ...result });
+});
+
+// --- EXAM LINK (drones pull the booking link found by the server's direct-IP
+// hunter; "" until found). This is the fast path: the server usually beats the
+// VPN-proxied drones to the link and hands it to all of them at once. ---
+app.get('/api/exam-link', (req, res) => {
+    res.json({ link: fleetState.examLink || "" });
+});
+
+// --- FOUND LINK (a drone got the booking link first and shares it with the
+// fleet). First valid link wins; we store it, stop the server's own hunt, and
+// every other drone picks it up from /api/exam-link. ---
+app.post('/api/found-link', (req, res) => {
+    const { droneId, link, via } = req.body || {};
+    if (link && !fleetState.examLink && /^https?:\/\//.test(link)) {
+        fleetState.examLink = link;
+        stopExamLinkPoller(); // we have it — stop hammering Goethe from the server too
+        sysLog(`🎯 Drone ${droneId} got the booking link first (${via || 'fetch'}) — sharing to all drones: ${link}`, 'success');
+        pushToDashboard('examLinkFound', { link, source: `drone ${droneId}` });
+    }
+    res.json({ status: "ok", link: fleetState.examLink || "" });
 });
 
 // --- GO STATUS (extension polls this to know if it may start booking yet) ---
@@ -923,17 +1224,27 @@ app.post('/api/stop', (req, res) => {
     sysLog("🚨 EMERGENCY KILL SWITCH ENGAGED! Destroying swarm...", "error");
     fleetState.isRunning = false;
     fleetState.automationStartAt = null;
+    fleetState.examLink = "";
     stopHeartbeat();
+    stopExamLinkPoller();
     allowSleep(); // restore normal sleep/lock behaviour
     if (scheduledTimer) { clearTimeout(scheduledTimer); scheduledTimer = null; }
 
-    const max = parseInt(fleetState.config.maxBrowsers) || 10;
-    for (let i = 1; i <= max; i++) {
-        assassinateDrone(i);
-    }
+    // Kill EVERY launched drone — not just 1..maxBrowsers. With a network mix the
+    // fleet can be larger than maxBrowsers (e.g. 2 direct + 4 NordVPN = 6), and the
+    // NordVPN drones are the higher-numbered ones; the old maxBrowsers loop left
+    // them running. Use the union of: actually-tracked drones + the full planned
+    // count + a safety ceiling — so nothing survives the kill switch.
+    const idsToKill = new Set(Object.keys(fleetState.activeDrones).map(Number));
+    const planned = fleetState.droneCount || parseInt(fleetState.config.maxBrowsers) || 0;
+    const ceiling = Math.max(planned, 20); // safety: also sweep a generous range
+    for (let i = 1; i <= ceiling; i++) idsToKill.add(i);
+    idsToKill.forEach(id => assassinateDrone(id));
 
     proxyRelay.stopAllRelays();
     fleetState.activeDrones = {};
+    fleetState.droneNetwork = {};
+    fleetState.droneCount = 0;
     fleetState.users.forEach(u => {
         if (u.status.includes('Running') || u.status === 'OTP_Wait') u.status = 'Queued';
     });
@@ -995,6 +1306,7 @@ app.get('/api/grab-user/:droneId', (req, res) => {
     fleetState.users[userIndex].status = `Running (Drone ${droneId})`;
     if (fleetState.activeDrones[droneId]) {
         fleetState.activeDrones[droneId].assignedUserIndex = userIndex;
+        fleetState.activeDrones[droneId].noUser = false; // got a user — clear the holding flag
     }
 
     sysLog(`🎯 Drone ${droneId} assigned: ${fleetState.users[userIndex].email}`, 'success');
@@ -1057,6 +1369,16 @@ app.post('/api/bot-status', (req, res) => {
             sysLog(`🔍 Auto-spotlight: Drone ${droneId} reached '${page}' — brought to front.`, 'info');
         }
     }
+    res.json({ status: "ok" });
+});
+
+// --- DRONE LOG (Extension pushes a milestone into the GLOBAL system log feed) ---
+// Lets a drone surface noteworthy events (got the booking link, rate-limited,
+// rotating IP) in the main dashboard log — not just its own status row.
+app.post('/api/drone-log', (req, res) => {
+    const { droneId, message, type } = req.body || {};
+    const t = ['info', 'warn', 'error', 'success'].includes(type) ? type : 'info';
+    sysLog(`Drone ${droneId}: ${message}`, t);
     res.json({ status: "ok" });
 });
 
@@ -1123,34 +1445,73 @@ app.post('/api/release-user/:droneId', (req, res) => {
 });
 
 // --- NO MATCH (Extension found an opening but no queued user wants these modules) ---
-// Stops this drone cleanly and reports it. Other drones keep hunting in case
-// a slot with different modules opens up that DOES match a remaining user.
+// We KEEP the drone alive (browser stays open) and just notify on the dashboard
+// that it has no valid user to continue. The extension keeps re-checking, so if a
+// matching user is added/freed, this drone picks it up automatically.
 app.post('/api/no-match/:droneId', (req, res) => {
     const { droneId } = req.params;
     const drone = fleetState.activeDrones[droneId];
 
-    sysLog(`🚫 Drone ${droneId}: An opening was found but no queued user matches its modules. Stopping this drone.`, 'warn');
-    pushToDashboard('droneUpdate', { droneId, status: '🚫 Stopped — no matching user for available modules', proxy: drone && drone.proxy ? `${drone.proxy.host}:${drone.proxy.port}` : 'Direct', user: null });
-
-    assassinateDrone(droneId);
-    delete fleetState.activeDrones[droneId];
-
-    // If no drones remain active and no users are running, note completion.
-    const anyActive = Object.keys(fleetState.activeDrones).length > 0;
-    if (!anyActive) {
-        const queuedExist = fleetState.users.some(u => u.status === 'Queued');
-        if (queuedExist) {
-            sysLog(`ℹ️ All drones stopped. ${fleetState.users.filter(u => u.status === 'Queued').length} user(s) still queued but their modules weren't available.`, 'warn');
-        }
-        checkFleetComplete();
+    // The extension re-checks every few seconds; only log/notify on the FIRST
+    // time so we don't flood the activity log.
+    const firstTime = !(drone && drone.noUser);
+    if (drone) { drone.noUser = true; drone.status = 'no_user'; drone.lastChangeAt = Date.now(); }
+    if (firstTime) {
+        sysLog(`⚠️ Drone ${droneId}: opening found, but no queued user matches its modules. Holding the drone (browser kept open).`, 'warn');
+        pushToDashboard('droneUpdate', { droneId, status: '⚠️ No valid user for these modules — holding', proxy: drone && drone.proxy ? `${drone.proxy.host}:${drone.proxy.port}` : 'Direct', user: null, noUser: true });
     }
+
+    res.json({ status: "ok", hold: true });
+});
+
+// ==========================================
+// PER-DRONE BOT CONTROL (pause / resume)
+// A drone can be paused two ways: MANUALLY from the dashboard (Stop Bot), or
+// AUTOMATICALLY when it reaches the page set in config.pauseAtPage (e.g. payment)
+// — then it waits for a human to press Continue. The extension polls
+// /drone-control to decide whether to act.
+// ==========================================
+app.get('/api/drone-control/:droneId', (req, res) => {
+    const drone = fleetState.activeDrones[req.params.droneId];
+    res.json({
+        paused: !!(drone && drone.paused),
+        pausedPage: (drone && drone.pausedPage) || null,
+        resumedPage: (drone && drone.resumedPage) || null,
+        pauseAtPage: fleetState.config.pauseAtPage || ''
+    });
+});
+
+app.post('/api/pause-drone/:droneId', (req, res) => {
+    const { droneId } = req.params;
+    const { page, manual } = req.body || {};
+    const drone = fleetState.activeDrones[droneId];
+    if (drone) { drone.paused = true; drone.pausedPage = page || null; drone.pausedManual = !!manual; }
+    const why = manual ? 'manually stopped' : (page ? `auto-paused at ${page}` : 'paused');
+    sysLog(`⏸ Drone ${droneId} ${why} — waiting for Continue.`, 'warn');
+    pushToDashboard('dronePaused', { droneId, page: page || null, manual: !!manual });
     res.json({ status: "ok" });
 });
 
-// --- REPORT 429 (Extension detected rate limit) ---
+app.post('/api/resume-drone/:droneId', (req, res) => {
+    const { droneId } = req.params;
+    const drone = fleetState.activeDrones[droneId];
+    if (drone) {
+        // For an auto-pause at a page, remember it's cleared so it won't instantly
+        // re-pause on that same page; manual pauses don't set a resume marker.
+        if (!drone.pausedManual && drone.pausedPage) drone.resumedPage = drone.pausedPage;
+        drone.paused = false; drone.pausedPage = null; drone.pausedManual = false;
+    }
+    sysLog(`▶ Drone ${droneId} resumed.`, 'success');
+    pushToDashboard('droneResumed', { droneId });
+    res.json({ status: "ok" });
+});
+
+// --- REPORT 429 (Extension detected rate limit OR a permanent IP ban) ---
 app.post('/api/report-429', (req, res) => {
-    const { droneId } = req.body;
-    sysLog(`🛑 Drone ${droneId} hit 429 Rate Limit! Executing Burn & Rotate...`, 'error');
+    const { droneId, banned, bannedIp } = req.body;
+    sysLog(banned
+        ? `🚫 Drone ${droneId}: IP permanently BANNED by Goethe${bannedIp ? ` (${bannedIp})` : ''}. Saving to ban list & rotating...`
+        : `🛑 Drone ${droneId} hit 429 Rate Limit! Burning for this run only (reverts next run) & rotating...`, 'error');
 
     const droneData = fleetState.activeDrones[droneId];
 
@@ -1162,9 +1523,17 @@ app.post('/api/report-429', (req, res) => {
         pushToDashboard('updateUser', { index: uIdx, status: '⏳ Queued', color: '#334155' });
     }
 
-    // Burn the proxy that got rate-limited
+    // Burn the proxy. A permanent ban also sets permanentlyBanned AND is saved to
+    // the persistent ban file so it's excluded in this and all future runs (until
+    // the user clears it). A 429 (banned=false) is NOT persisted — temporary only.
     if (droneData && droneData.proxy) {
         burnProxy(droneData.proxy);
+        if (banned) {
+            const p = fleetState.proxyPool.find(x => x.id === droneData.proxy.id);
+            if (p) p.permanentlyBanned = true;
+            addPermanentBan(droneData.proxy.id, { host: droneData.proxy.host, country: droneData.proxy.country, ip: bannedIp });
+            pushToDashboard('banUpdate', {}); // tell the dashboard to refresh its ban list
+        }
     }
 
     // Kill the drone browser
@@ -1173,12 +1542,14 @@ app.post('/api/report-429', (req, res) => {
 
     pushToDashboard('droneUpdate', { droneId, status: '🔥 Burned — Respawning...', proxy: 'Rotating...', user: null });
 
-    // Wait for browser to close, then relaunch with new proxy
+    // Wait for browser to close, then relaunch with new proxy. Jittered (5–10s)
+    // so a mass rate-limit doesn't respawn every drone at once (which would burst
+    // past NordVPN's concurrent-connection limit and cause tunnel failures).
     setTimeout(() => {
         if (fleetState.isRunning) {
             launchDrone(droneId);
         }
-    }, 5000);
+    }, 5000 + Math.floor(Math.random() * 5000));
 
     res.json({ status: "ok" });
 });
@@ -1207,10 +1578,12 @@ app.post('/api/proxy-failed/:droneId', (req, res) => {
         }
     }
 
-    // Burn the failing proxy so getNextProxy() hands out a DIFFERENT server.
-    if (fleetState.proxyMode !== 'none' && drone.proxy) {
+    // Burn the failing proxy so getNextProxy() hands out a DIFFERENT server OF THE
+    // SAME PROVIDER. A 'direct' drone has no proxy → nothing to burn (failure stays
+    // isolated to this drone; it just retries on the ISP connection).
+    if (drone.proxy) {
         burnProxy(drone.proxy);
-        sysLog(`🔄 Drone ${droneId}: rotating to a different proxy server...`, 'warn');
+        sysLog(`🔄 Drone ${droneId} (${networkLabel(droneId)}): rotating to a different ${drone.proxy.provider || 'proxy'} server...`, 'warn');
     }
 
     assassinateDrone(droneId);
@@ -1218,8 +1591,10 @@ app.post('/api/proxy-failed/:droneId', (req, res) => {
     pushToDashboard('droneUpdate', { droneId, status: '📡 Network error — rotating IP...', proxy: 'Rotating...', user: null });
 
     // Wait for the browser/relay to close, then relaunch on a fresh proxy.
+    // Jittered (5–10s) so a simultaneous mass-failure doesn't respawn all drones
+    // at the same instant (which would burst NordVPN's concurrent-connection limit).
     if (fleetState.isRunning) {
-        setTimeout(() => { if (fleetState.isRunning) launchDrone(droneId); }, 5000);
+        setTimeout(() => { if (fleetState.isRunning) launchDrone(droneId); }, 5000 + Math.floor(Math.random() * 5000));
     }
     res.json({ status: "ok" });
 });
@@ -1272,7 +1647,19 @@ app.post('/api/start-drone/:droneId', async (req, res) => {
     if (!fleetState.isRunning) return res.status(400).json({ error: 'Fleet is not running' });
     const { droneId } = req.params;
     if (fleetState.activeDrones[droneId]) return res.status(400).json({ error: 'That drone is already active' });
-    sysLog(`➕ Manually starting Drone ${droneId} (others unaffected)...`, 'info');
+
+    // Assign this manual drone's network. If a type is given (mix mode), use it;
+    // otherwise it inherits the legacy single-mode network automatically.
+    const reqNet = ((req.body && req.body.network) || '').toString().toLowerCase();
+    if (['direct', 'nordvpn', 'custom'].includes(reqNet)) {
+        fleetState.droneNetwork[droneId] = reqNet;
+        if (reqNet !== 'direct' && !fleetState.proxyPool.some(p => p.provider === reqNet)) {
+            sysLog(`⚠️ Drone ${droneId}: no '${reqNet}' proxies in this run's pool — it will run Direct.`, 'warn');
+        }
+    }
+    // Keep the launched-drone count current so the kill switch covers this drone.
+    fleetState.droneCount = Math.max(fleetState.droneCount || 0, parseInt(droneId) || 0);
+    sysLog(`➕ Manually starting Drone ${droneId} → ${networkLabel(droneId)} (others unaffected)...`, 'info');
     await launchDrone(droneId);
     res.json({ status: 'ok' });
 });
@@ -1360,6 +1747,29 @@ app.get('/api/load-config', (req, res) => {
     res.json({ found: !!cfg, config: cfg || null });
 });
 
+// --- PERSISTENT BAN LIST: view + manual removal ---
+app.get('/api/banned-list', (req, res) => {
+    res.json({ banned: loadBannedList() });
+});
+app.post('/api/banned-remove', (req, res) => {
+    const { id, all } = req.body || {};
+    let list = loadBannedList();
+    if (all) {
+        list = [];
+        sysLog('🧹 Cleared the entire persistent IP ban list (manual).', 'warn');
+    } else if (id) {
+        list = list.filter(b => b.id !== id);
+        sysLog(`🧹 Removed ${id} from the persistent IP ban list (manual).`, 'info');
+        // Also un-ban it in the current run's pool so it can be used again now.
+        const p = fleetState.proxyPool.find(x => x.id === id);
+        if (p) { p.permanentlyBanned = false; p.burned = false; }
+        fleetState.burnedProxies = fleetState.proxyPool.filter(x => x.burned).map(x => x.id);
+    }
+    saveBannedList(list);
+    broadcastProxyStats();
+    res.json({ status: 'ok', banned: list });
+});
+
 // --- DOWNLOAD BOOKING HISTORY (CSV) ---
 app.get('/api/history', (req, res) => {
     if (!fs.existsSync(HISTORY_FILE)) {
@@ -1384,6 +1794,7 @@ app.get('/api/status', (req, res) => {
         drones: Object.entries(fleetState.activeDrones).map(([id, d]) => ({
             id,
             status: d.status,
+            network: networkLabel(id),
             proxy: d.proxy ? `${d.proxy.host}:${d.proxy.port}` : 'Direct',
             user: d.assignedUserIndex !== null ? fleetState.users[d.assignedUserIndex]?.email : null
         })),

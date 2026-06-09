@@ -1,0 +1,37 @@
+[
+  {
+    "id": "socks-us72.nordvpn.com:1080",
+    "host": "socks-us72.nordvpn.com",
+    "country": "United States",
+    "ip": "146.70.217.214",
+    "bannedAt": "2026-06-09T15:32:06.867Z"
+  },
+  {
+    "id": "socks-us73.nordvpn.com:1080",
+    "host": "socks-us73.nordvpn.com",
+    "country": "United States",
+    "ip": "146.70.217.206",
+    "bannedAt": "2026-06-09T15:32:34.516Z"
+  },
+  {
+    "id": "socks-nl8.nordvpn.com:1080",
+    "host": "socks-nl8.nordvpn.com",
+    "country": "Netherlands",
+    "ip": "213.232.87.234",
+    "bannedAt": "2026-06-09T16:46:59.694Z"
+  },
+  {
+    "id": "socks-nl6.nordvpn.com:1080",
+    "host": "socks-nl6.nordvpn.com",
+    "country": "Netherlands",
+    "ip": "213.232.87.230",
+    "bannedAt": "2026-06-09T16:48:36.793Z"
+  },
+  {
+    "id": "socks-nl5.nordvpn.com:1080",
+    "host": "socks-nl5.nordvpn.com",
+    "country": "Netherlands",
+    "ip": "213.232.87.228",
+    "bannedAt": "2026-06-09T16:48:42.480Z"
+  }
+]
